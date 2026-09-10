@@ -23,16 +23,18 @@ system sans-serif.
 
 | Action | Keys |
 | --- | --- |
-| Move & aim | `W` `A` `S` `D` or arrow keys |
+| Walk & aim | `A` `D` / left · right |
+| Climb (only against a wall) | `W` `S` / up · down |
 | Dig the tile you're aiming at | hold `Space` |
 | Dig a specific tile | click it (must be within reach) |
 | Place a carried block in the tile you're aiming at | hold `F` |
 | Zoom | mouse wheel, or `+` / `-` |
 
-On the **surface** the ant is under a light gravity: it walks left/right and
-settles onto the ground, `W`/`S` only *aim* it — no jump, and it can't fly off
-the terrain. Once its centre is in dug-out space **below the ground line** it
-moves freely in every direction.
+Gravity is always on and there is **no jump** — the ant walks, and it falls
+whenever nothing is underfoot. It never flies, above ground or below. `W`/`S`
+**climb** only while it's gripping a wall (a solid tile at its side): that's how
+you get back up a shaft you've dug, or scale a cliff face. In an open cavern
+with nothing to hold onto it just drops to the floor.
 
 The HUD tracks **DUG** (net tiles hollowed out), **BLOCKS** (spoil you can
 place), and **DEPTH**.

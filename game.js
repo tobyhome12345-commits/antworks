@@ -3,12 +3,12 @@
 
    HTML5 Canvas + vanilla JS. No build step: just open index.html.
 
-   The surface and the underground are ONE continuous tile map. On or above
-   the surface the ant is under a light gravity — it walks left/right and
-   settles onto the ground; up and down only AIM it, there is no jump. Once
-   its centre is inside dug-out space below the surface it moves freely in
-   every direction. Dug tiles become open sky; you can pack a carried block
-   back into ANY empty tile — underground or up in the air.
+   The surface and the underground are ONE continuous tile map. Gravity is
+   always on: the ant walks, and it falls whenever nothing is underfoot — it
+   never flies. Up / down climb only while it's gripping a wall (a solid tile
+   at its side), which is how you get back up a shaft you dug; there is no
+   jump. Dug tiles become open sky; you can pack a carried block back into ANY
+   empty tile — underground or up in the air.
 
    SECTION MAP:
       1. CONFIG        constants + palette
@@ -176,7 +176,6 @@ const player = {
   vy: 0,
   face: { x: 1, y: 0 },   // last direction pressed, kept even when a wall blocks it
   flip: false,
-  underground: false,
   depth: 0,
   animPhase: 0,
 };
@@ -203,13 +202,18 @@ const boxOverlapsTile = (tx, ty) => {
          player.y < by + CFG.TILE && player.y + player.h > by;
 };
 
-// Free movement (no gravity, dig any direction) only once the ant's centre is
-// in open space strictly BELOW the natural ground line. Everything else — sky,
-// the very first dug row, a rising step it's briefly sunk into — is "surface".
-function isUnderground() {
-  const cx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
-  const cy = Math.floor((player.y + player.h / 2) / CFG.TILE);
-  return getTile(cx, cy) === T.AIR && cy > surfaceAt[cx];
+// Is there a solid tile in the column just left or right of the ant, alongside
+// its body? An ant with a wall to grip can climb it (this is how you get back
+// up a one-wide shaft); out in open space — a wide cavern, the sky — there's
+// nothing to hold, so it just falls. No flying.
+function grippingWall() {
+  const y0 = Math.floor(player.y / CFG.TILE);
+  const y1 = Math.floor((player.y + player.h - 1) / CFG.TILE);
+  const lc = Math.floor(player.x / CFG.TILE) - 1;
+  const rc = Math.floor((player.x + player.w - 1) / CFG.TILE) + 1;
+  for (let ty = y0; ty <= y1; ty++)
+    if (tileIsSolid(lc, ty) || tileIsSolid(rc, ty)) return true;
+  return false;
 }
 
 function movePlayer(dt) {
@@ -220,15 +224,15 @@ function movePlayer(dt) {
     if (ix) player.flip = ix < 0;
   }
 
-  player.underground = isUnderground();
   const step = CFG.SPEED * dt;
 
-  // ---- horizontal ----
+  // ---- horizontal ---- (auto-climb an open one-tile lip; a wall with soil
+  // above it still blocks, so you can't "stair-step" up an enclosed shaft)
   if (ix) {
     const dx = ix * step;
     if (!boxHitsSolid(player.x + dx, player.y)) {
       player.x += dx;
-    } else if (!player.underground) {
+    } else {
       for (let lift = 8; lift <= CFG.STEP_UP; lift += 8) {
         if (!boxHitsSolid(player.x + dx, player.y - lift)) {
           player.x += dx;
@@ -240,14 +244,13 @@ function movePlayer(dt) {
     player.animPhase += step * 0.09;
   }
 
-  // ---- vertical ----
-  if (player.underground) {
+  // ---- vertical ---- climb only while gripping a wall; otherwise gravity.
+  // There is no jump anywhere, above ground or below.
+  if (iy && grippingWall()) {
     player.vy = 0;
-    if (iy) {
-      const dy = iy * step;
-      if (!boxHitsSolid(player.x, player.y + dy)) player.y += dy;
-      player.animPhase += step * 0.09;
-    }
+    const dy = iy * step;
+    if (!boxHitsSolid(player.x, player.y + dy)) player.y += dy;
+    player.animPhase += step * 0.09;
   } else {
     player.vy = Math.min(player.vy + CFG.GRAVITY * dt, CFG.MAX_FALL);
     const dy = player.vy * dt;
