@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Antworks</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #8ec7e6;
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    #game { display: block; image-rendering: pixelated; cursor: crosshair; }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <!-- ======================================================================
+       SINGLE-FILE BUILD. This is index.html + game.js combined into one file
+       so it runs from a plain double-click with nothing else alongside it.
+       The split version (index.html + game.js) is the one to edit; keep them
+       in sync, or regenerate this file from them.
+       ====================================================================== -->
+  <script>
+/* =========================================================================
+   ANTWORKS  —  a tiny dig-'em-up about one ant and a great deal of dirt.
+   HTML5 Canvas + vanilla JS. No build step.
+
+   The surface and the underground are ONE continuous tile map. Above the
+   ground line is walkable open air / terrain; below it is solid dirt and
+   rock you can tunnel through. Dug tiles stay dug.
+
+   SECTION MAP:
+      1. CONFIG   2. CANVAS   3. TILES   4. WORLDGEN   5. PLAYER   6. INPUT
+      7. CAMERA   8. DIGGING  9. PARTICLES  10. UPDATE  11. RENDER  12. LOOP
+
+   EXTEND markers inline show where food, other insects, an oxygen/light
+   meter, and save/load slot in.
+   ========================================================================= */
+
+'use strict';
+
+/* --- 1. CONFIG --------------------------------------------------------- */
+const CFG = {
+  TILE: 32,              // px per tile
+  MAP_W: 220,            // tiles wide
+  MAP_H: 110,            // tiles tall
+  SURFACE_ROW: 22,       // baseline ground row (~20% down the map)
+
+  SPEED: 175,            // ant walk speed, px/sec — snappy, not floaty
+  WATER_SLOW: 0.6,       // movement multiplier while wading
+
+  DIG_TIME_DIRT: 0.45,   // seconds to break one dirt tile
+  DIG_TIME_ROCK: 1.7,    // seconds to break one hard-rock tile
+  DIG_REACH: 1.7,        // tiles: how far a mouse click may reach to dig
+  FILL_COOLDOWN: 0.16,   // seconds between back-fill placements
+
+  CAM_LERP: 9,           // camera follow stiffness (higher = snappier)
+  ZOOM_MIN: 0.35,
+  ZOOM_MAX: 2.5,
+  ZOOM_STEP: 1.12,       // multiply/divide per wheel notch or +/- press
+};
+
+/* --- 2. CANVAS ------------------------------------------------------------ */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let VIEW_W = 0, VIEW_H = 0;
+
+function resize() {
+  VIEW_W = canvas.width  = window.innerWidth;
+  VIEW_H = canvas.height = window.innerHeight;
+  zoomBy(1); // re-clamp zoom so the view never ends up bigger than the map
+}
+window.addEventListener('resize', resize);
+
+/* --- 3. TILES ---------------------------------------------------------- */
+const T = {
+  AIR:     0,  // open sky above the ground line
+  GRASS:   1,  // the ground cap — walkable, not diggable
+  DIRT:    2,  // solid, diggable
+  ROCK:    3,  // solid, diggable but slow
+  WATER:   4,  // walkable, slows you down, not diggable
+  STICK:   5,  // surface decoration, walkable
+  TUNNEL:  6,  // a tile that has been dug out — walkable
+  BOULDER: 7,  // surface obstacle — solid, not diggable
+};
+
+const SOLID    = { [T.DIRT]: 1, [T.ROCK]: 1, [T.BOULDER]: 1 };
+const DIGGABLE = { [T.DIRT]: 1, [T.ROCK]: 1 };
+
+const MAP_PX_W = CFG.MAP_W * CFG.TILE;
+const MAP_PX_H = CFG.MAP_H * CFG.TILE;
+
+let grid;        // Int8Array, row-major:  index = ty * MAP_W + tx
+let surfaceAt;   // Int16Array[MAP_W]: ground row per column
+
+const clamp    = (v, a, b) => (v < a ? a : v > b ? b : v);
+const inBounds = (tx, ty) => tx >= 0 && ty >= 0 && tx < CFG.MAP_W && ty < CFG.MAP_H;
+const tIndex   = (tx, ty) => ty * CFG.MAP_W + tx;
+
+// Out-of-bounds reads as solid DIRT so the ant can never leave the map.
+const getTile     = (tx, ty) => (inBounds(tx, ty) ? grid[tIndex(tx, ty)] : T.DIRT);
+const setTile     = (tx, ty, v) => { if (inBounds(tx, ty)) grid[tIndex(tx, ty)] = v; };
+const tileIsSolid = (tx, ty) => !!SOLID[getTile(tx, ty)];
+
+/* --- 4. WORLDGEN ----------------------------------------------------------
+   Fill below the surface with DIRT, then stamp rock blobs, carve caves,
+   pour puddles, scatter clutter. Returns the tile the ant spawns on.
+   -------------------------------------------------------------------------- */
+function generateWorld() {
+  grid = new Int8Array(CFG.MAP_W * CFG.MAP_H);
+  surfaceAt = new Int16Array(CFG.MAP_W);
+
+  // 4a. rolling ground line + solid dirt underneath
+  for (let tx = 0; tx < CFG.MAP_W; tx++) {
+    const h = Math.round(
+      CFG.SURFACE_ROW
+      + 3.0 * Math.sin(tx * 0.080)
+      + 2.0 * Math.sin(tx * 0.021 + 1.3)
+      + 1.5 * Math.sin(tx * 0.005 + 4.0)
+    );
+    surfaceAt[tx] = h;
+    for (let ty = 0; ty < CFG.MAP_H; ty++) {
+      if (ty < h)        setTile(tx, ty, T.AIR);
+      else if (ty === h) setTile(tx, ty, T.GRASS);
+      else               setTile(tx, ty, T.DIRT);
+    }
+  }
+
+  // 4b. hard-rock blobs, deeper down
+  for (let i = 0; i < 90; i++) {
+    const cx = 2 + ((Math.random() * (CFG.MAP_W - 4)) | 0);
+    const minY = surfaceAt[cx] + 5;
+    const cy = minY + ((Math.random() * (CFG.MAP_H - minY - 2)) | 0);
+    const r = 2 + ((Math.random() * 2) | 0);   // 2..3 — rounder blobs
+    for (let dy = -r; dy <= r; dy++)
+      for (let dx = -r; dx <= r; dx++)
+        if (dx * dx + dy * dy <= r * r && getTile(cx + dx, cy + dy) === T.DIRT)
+          setTile(cx + dx, cy + dy, T.ROCK);
+  }
+
+  // 4c. pre-existing caves — carve with a wandering brush
+  for (let i = 0; i < 16; i++) {
+    let cx = 8 + ((Math.random() * (CFG.MAP_W - 16)) | 0);
+    let cy = surfaceAt[cx] + 8 + ((Math.random() * (CFG.MAP_H - surfaceAt[cx] - 14)) | 0);
+    const steps = 30 + ((Math.random() * 70) | 0);
+    for (let s = 0; s < steps; s++) {
+      carveBlob(cx, cy, 1 + ((Math.random() * 1.6) | 0));
+      cx = clamp(cx + ((Math.random() * 3) | 0) - 1, 2, CFG.MAP_W - 3);
+      cy += ((Math.random() * 3) | 0) - 1;
+      cy = clamp(cy, surfaceAt[cx] + 4, CFG.MAP_H - 3); // never breach the surface
+    }
+  }
+
+  // 4d. puddles in the surface dips
+  for (let tx = 3; tx < CFG.MAP_W - 3; tx++) {
+    if (surfaceAt[tx] > surfaceAt[tx - 1] &&
+        surfaceAt[tx] >= surfaceAt[tx + 1] &&
+        Math.random() < 0.25) {
+      const w = 1 + ((Math.random() * 3) | 0);
+      const d = 1 + ((Math.random() * 2) | 0);
+      for (let x = tx - w; x <= tx + w; x++) {
+        const base = surfaceAt[clamp(x, 0, CFG.MAP_W - 1)];
+        for (let y = base; y > base - d; y--) {
+          const t = getTile(x, y);
+          if (t === T.GRASS || t === T.AIR) setTile(x, y, T.WATER);
+        }
+      }
+    }
+  }
+
+  // 4e. surface clutter — twigs (walkable) and boulders (obstacles)
+  for (let tx = 1; tx < CFG.MAP_W - 1; tx++) {
+    const g = surfaceAt[tx];
+    if (getTile(tx, g) !== T.GRASS) continue;
+    const roll = Math.random();
+    if (roll < 0.05)      setTile(tx, g - 1, T.BOULDER);
+    else if (roll < 0.20) setTile(tx, g - 1, T.STICK);
+  }
+
+  // 4f. clear a pocket so the ant never spawns buried or boxed in
+  const sx = 12;
+  const sy = surfaceAt[sx] - 1;
+  for (let dy = -2; dy <= 1; dy++)
+    for (let dx = -2; dx <= 2; dx++) {
+      const t = getTile(sx + dx, sy + dy);
+      if (t === T.BOULDER || t === T.STICK || t === T.WATER)
+        setTile(sx + dx, sy + dy, T.AIR);
+    }
+
+  return { sx, sy };
+}
+
+function carveBlob(cx, cy, r) {
+  for (let dy = -r; dy <= r; dy++)
+    for (let dx = -r; dx <= r; dx++)
+      if (dx * dx + dy * dy <= r * r) {
+        const t = getTile(cx + dx, cy + dy);
+        if (t === T.DIRT || t === T.ROCK) setTile(cx + dx, cy + dy, T.TUNNEL);
+      }
+}
+
+/* --- 5. PLAYER (the ant) -----------------------------------------------
+   No gravity: moves freely through any non-solid tile. AABB-vs-tiles
+   collision, resolved one axis at a time so you slide along walls.
+   -------------------------------------------------------------------------- */
+const player = {
+  x: 0, y: 0,
+  w: 22, h: 14,
+  face: { x: 1, y: 0 },   // last non-zero input direction (for Space-digging)
+  flip: false,            // drawing: true = facing left
+  depth: 0,               // tiles below the local surface (0 on top)
+  animPhase: 0,           // leg-wiggle clock, advances only while walking
+};
+
+function spawnPlayer(tx, ty) {
+  player.x = tx * CFG.TILE + (CFG.TILE - player.w) / 2;
+  player.y = ty * CFG.TILE + (CFG.TILE - player.h) / 2;
+}
+
+function boxHitsSolid(px, py) {
+  const x0 = Math.floor(px / CFG.TILE);
+  const y0 = Math.floor(py / CFG.TILE);
+  const x1 = Math.floor((px + player.w - 1) / CFG.TILE);
+  const y1 = Math.floor((py + player.h - 1) / CFG.TILE);
+  for (let ty = y0; ty <= y1; ty++)
+    for (let tx = x0; tx <= x1; tx++)
+      if (tileIsSolid(tx, ty)) return true;
+  return false;
+}
+
+const boxOverlapsTile = (tx, ty) => {
+  const bx = tx * CFG.TILE, by = ty * CFG.TILE;
+  return player.x < bx + CFG.TILE && player.x + player.w > bx &&
+         player.y < by + CFG.TILE && player.y + player.h > by;
+};
+
+function movePlayer(dt) {
+  const ix = (keyDown('a', 'arrowleft') ? -1 : 0) + (keyDown('d', 'arrowright') ? 1 : 0);
+  const iy = (keyDown('w', 'arrowup')   ? -1 : 0) + (keyDown('s', 'arrowdown')  ? 1 : 0);
+
+  if (ix || iy) {
+    const inv = 1 / Math.hypot(ix, iy);
+    player.face = { x: Math.sign(ix), y: Math.sign(iy) };
+    if (ix) player.flip = ix < 0;
+
+    const ct = getTile(
+      Math.floor((player.x + player.w / 2) / CFG.TILE),
+      Math.floor((player.y + player.h / 2) / CFG.TILE)
+    );
+    const step = CFG.SPEED * (ct === T.WATER ? CFG.WATER_SLOW : 1) * dt;
+
+    const nx = player.x + ix * inv * step;
+    const ny = player.y + iy * inv * step;
+    if (!boxHitsSolid(nx, player.y)) player.x = nx;
+    if (!boxHitsSolid(player.x, ny)) player.y = ny;
+
+    player.animPhase += step * 0.09;
+  }
+
+  player.x = clamp(player.x, 0, MAP_PX_W - player.w);
+  player.y = clamp(player.y, 0, MAP_PX_H - player.h);
+
+  // EXTEND: drive an oxygen/light meter from player.depth
+  const ptx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
+  const pfy = Math.floor((player.y + player.h) / CFG.TILE);
+  player.depth = Math.max(0, pfy - surfaceAt[ptx]);
+}
+
+/* --- 6. INPUT -------------------------------------------------------------- */
+const keys = new Set();
+const mouse = { x: 0, y: 0, down: false };
+
+const keyDown = (...names) => names.some((n) => keys.has(n));
+const norm = (k) => (k === ' ' ? 'space' : k.toLowerCase());
+
+window.addEventListener('keydown', (e) => {
+  const k = norm(e.key);
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'space'].includes(k)) e.preventDefault();
+  if (k === '+' || k === '=') zoomBy(CFG.ZOOM_STEP);
+  if (k === '-' || k === '_') zoomBy(1 / CFG.ZOOM_STEP);
+  keys.add(k);
+});
+window.addEventListener('keyup', (e) => keys.delete(norm(e.key)));
+window.addEventListener('blur', () => keys.clear());
+
+canvas.addEventListener('mousemove', (e) => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = e.clientX - r.left;
+  mouse.y = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown', () => { mouse.down = true; });
+window.addEventListener('mouseup', () => { mouse.down = false; });
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoomBy(e.deltaY < 0 ? CFG.ZOOM_STEP : 1 / CFG.ZOOM_STEP);
+}, { passive: false });
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+/* --- 7. CAMERA ---------------------------------------------------------- */
+const cam = { x: 0, y: 0, zoom: 1 };
+
+function zoomBy(factor) {
+  cam.zoom = clamp(cam.zoom * factor, CFG.ZOOM_MIN, CFG.ZOOM_MAX);
+  cam.zoom = Math.max(cam.zoom, VIEW_W / MAP_PX_W, VIEW_H / MAP_PX_H);
+}
+
+function updateCamera(dt) {
+  const viewWunits = VIEW_W / cam.zoom;
+  const viewHunits = VIEW_H / cam.zoom;
+  const targetX = player.x + player.w / 2 - viewWunits / 2;
+  const targetY = player.y + player.h / 2 - viewHunits / 2;
+
+  const t = 1 - Math.exp(-CFG.CAM_LERP * dt);   // frame-rate-independent smoothing
+  cam.x += (targetX - cam.x) * t;
+  cam.y += (targetY - cam.y) * t;
+
+  cam.x = clamp(cam.x, 0, Math.max(0, MAP_PX_W - viewWunits));
+  cam.y = clamp(cam.y, 0, Math.max(0, MAP_PX_H - viewHunits));
+}
+
+const worldToScreen = (wx, wy) => ({ x: (wx - cam.x) * cam.zoom, y: (wy - cam.y) * cam.zoom });
+const screenToWorld = (sx, sy) => ({ x: sx / cam.zoom + cam.x, y: sy / cam.zoom + cam.y });
+
+/* --- 8. DIGGING (and back-filling) ------------------------------------- */
+const digProgress = new Map();   // "tx,ty" -> seconds worked so far (persists between visits)
+let digTarget = null;
+let tilesDug = 0;
+let dirtCarried = 0;             // EXTEND: cap this, make heavy loads slow you, drop piles...
+let fillCooldown = 0;
+
+function pickDigTarget() {
+  // (a) mouse: any diggable tile within reach of the ant
+  if (mouse.down) {
+    const w = screenToWorld(mouse.x, mouse.y);
+    const tx = Math.floor(w.x / CFG.TILE);
+    const ty = Math.floor(w.y / CFG.TILE);
+    const pcx = (player.x + player.w / 2) / CFG.TILE;
+    const pcy = (player.y + player.h / 2) / CFG.TILE;
+    if (DIGGABLE[getTile(tx, ty)] &&
+        Math.hypot(tx + 0.5 - pcx, ty + 0.5 - pcy) <= CFG.DIG_REACH + 0.5) {
+      return { tx, ty };
+    }
+  }
+  // (b) Space: the tile directly ahead of the ant's face
+  if (keys.has('space')) {
+    const d = (player.face.x || player.face.y) ? player.face
+                                              : { x: player.flip ? -1 : 1, y: 0 };
+    const probeX = player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35);
+    const probeY = player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35);
+    const tx = Math.floor(probeX / CFG.TILE);
+    const ty = Math.floor(probeY / CFG.TILE);
+    if (DIGGABLE[getTile(tx, ty)]) return { tx, ty };
+  }
+  return null;
+}
+
+function updateDigging(dt) {
+  digTarget = pickDigTarget();
+  if (!digTarget) return;
+
+  const { tx, ty } = digTarget;
+  const key = tx + ',' + ty;
+  const need = getTile(tx, ty) === T.ROCK ? CFG.DIG_TIME_ROCK : CFG.DIG_TIME_DIRT;
+  const worked = (digProgress.get(key) || 0) + dt;
+
+  if (worked >= need) {
+    const wasRock = getTile(tx, ty) === T.ROCK;
+    setTile(tx, ty, T.TUNNEL);           // dug tiles stay dug
+    digProgress.delete(key);
+    tilesDug++;
+    dirtCarried += wasRock ? 2 : 1;
+    puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, wasRock);
+  } else {
+    digProgress.set(key, worked);
+  }
+}
+
+// Hold F, facing an open tunnel tile, to pack dirt back into it.
+function updateFill(dt) {
+  fillCooldown -= dt;
+  if (!keys.has('f') || dirtCarried <= 0 || fillCooldown > 0) return;
+
+  const d = (player.face.x || player.face.y) ? player.face
+                                            : { x: player.flip ? -1 : 1, y: 0 };
+  const tx = Math.floor((player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35)) / CFG.TILE);
+  const ty = Math.floor((player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35)) / CFG.TILE);
+
+  if (getTile(tx, ty) === T.TUNNEL && !boxOverlapsTile(tx, ty)) {
+    setTile(tx, ty, T.DIRT);
+    dirtCarried--;
+    tilesDug = Math.max(0, tilesDug - 1);
+    puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, false);
+    fillCooldown = CFG.FILL_COOLDOWN;
+  }
+}
+
+/* --- 9. PARTICLES (dirt puffs) --------------------------------------------- */
+const particles = [];
+
+function puff(x, y, rock) {
+  const n = rock ? 16 : 11;
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const sp = 20 + Math.random() * 70;
+    particles.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 20,
+      life: 0.5 + Math.random() * 0.4,
+      max: 0.9,
+      r: 1 + Math.random() * 2.5,
+      col: rock ? '#8d8d8d' : (Math.random() < 0.5 ? '#6b4326' : '#7d5233'),
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vy += 260 * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.vx *= (1 - 2.5 * dt);
+    p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+/* --- 10. UPDATE --------------------------------------------------------- */
+function update(dt) {
+  movePlayer(dt);
+  updateDigging(dt);
+  updateFill(dt);
+  updateParticles(dt);
+  updateCamera(dt);
+  // EXTEND: entity AI, resource spawns, oxygen drain, day/night, etc.
+}
+
+/* --- 11. RENDER ------------------------------------------------------------ */
+let nowMs = 0;
+const rgb = (r, g, b) => `rgb(${r | 0},${g | 0},${b | 0})`;
+
+function tileTint(tx, ty) {
+  let h = (tx * 73856093) ^ (ty * 19349663);
+  return ((h >>> 0) % 17) - 8;   // -8 .. +8
+}
+
+function render() {
+  ctx.fillStyle = '#8ec7e6';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  ctx.save();
+  ctx.scale(cam.zoom, cam.zoom);
+  ctx.translate(-cam.x, -cam.y);
+
+  drawTiles();
+  drawDigOverlay();
+  drawParticles();
+  drawAnt();
+
+  ctx.restore();
+
+  drawLighting();
+  drawHUD();
+}
+
+function drawTiles() {
+  const S = CFG.TILE;
+  const x0 = Math.max(0, Math.floor(cam.x / S));
+  const y0 = Math.max(0, Math.floor(cam.y / S));
+  const x1 = Math.min(CFG.MAP_W - 1, Math.ceil((cam.x + VIEW_W / cam.zoom) / S));
+  const y1 = Math.min(CFG.MAP_H - 1, Math.ceil((cam.y + VIEW_H / cam.zoom) / S));
+
+  for (let ty = y0; ty <= y1; ty++) {
+    for (let tx = x0; tx <= x1; tx++) {
+      const v = grid[tIndex(tx, ty)];
+      const px = tx * S, py = ty * S;
+      const n = tileTint(tx, ty);
+
+      switch (v) {
+        case T.AIR:
+          break;
+
+        case T.TUNNEL:
+          ctx.fillStyle = rgb(42 + n, 31 + n, 25 + n);
+          ctx.fillRect(px, py, S, S);
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          ctx.fillRect(px, py, S, 3);
+          break;
+
+        case T.GRASS:
+          ctx.fillStyle = rgb(120 + n, 78 + n, 46 + n);
+          ctx.fillRect(px, py, S, S);
+          ctx.fillStyle = rgb(78 + n, 138 + n, 62 + n);
+          ctx.fillRect(px, py, S, 7);
+          break;
+
+        case T.DIRT:
+          ctx.fillStyle = rgb(120 + n, 78 + n, 46 + n);
+          ctx.fillRect(px, py, S, S);
+          ctx.fillStyle = rgb(95 + n, 60 + n, 34 + n);
+          ctx.fillRect(px + ((tx * 11) % (S - 6)), py + ((ty * 7) % (S - 6)), 3, 3);
+          ctx.fillRect(px + ((tx * 19 + 5) % (S - 4)), py + ((ty * 13 + 9) % (S - 4)), 2, 2);
+          break;
+
+        case T.ROCK:
+          ctx.fillStyle = rgb(120 + n, 120 + n, 128 + n);
+          ctx.fillRect(px, py, S, S);
+          ctx.fillStyle = rgb(99 + n, 99 + n, 107 + n);
+          ctx.fillRect(px + 4, py + 4, S - 8, S - 8);
+          break;
+
+        case T.WATER: {
+          ctx.fillStyle = rgb(58, 120, 190);
+          ctx.fillRect(px, py, S, S);
+          ctx.fillStyle = 'rgba(255,255,255,0.12)';
+          const wob = Math.sin(nowMs * 0.002 + tx * 0.6) * 2;
+          ctx.fillRect(px, py + 4 + wob, S, 3);
+          break;
+        }
+
+        case T.STICK:
+          ctx.strokeStyle = rgb(110, 74, 42);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(px + 6, py + S - 6);
+          ctx.lineTo(px + S - 6, py + S - 15);
+          ctx.stroke();
+          break;
+
+        case T.BOULDER:
+          ctx.fillStyle = rgb(112, 112, 118);
+          ctx.beginPath();
+          ctx.arc(px + S / 2, py + S / 2 + 5, S / 2 - 2, Math.PI, 0);
+          ctx.fill();
+          ctx.fillRect(px + 2, py + S / 2 + 4, S - 4, S / 2 - 2);
+          break;
+      }
+    }
+  }
+}
+
+function drawDigOverlay() {
+  const S = CFG.TILE;
+
+  for (const [key, worked] of digProgress) {
+    const [tx, ty] = key.split(',').map(Number);
+    const need = getTile(tx, ty) === T.ROCK ? CFG.DIG_TIME_ROCK : CFG.DIG_TIME_DIRT;
+    const f = clamp(worked / need, 0, 1);
+    const px = tx * S, py = ty * S;
+
+    ctx.fillStyle = `rgba(0,0,0,${0.15 + 0.4 * f})`;
+    ctx.fillRect(px + (f * S) / 2, py + (f * S) / 2, S - f * S, S - f * S);
+
+    ctx.strokeStyle = '#ffd479';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(px + S / 2, py + S / 2, S * 0.32, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
+    ctx.stroke();
+  }
+
+  if (digTarget) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(digTarget.tx * S + 1, digTarget.ty * S + 1, S - 2, S - 2);
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - p.r, p.y - p.r, p.r * 2, p.r * 2);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawAnt() {
+  const cx = player.x + player.w / 2;
+  const cy = player.y + player.h / 2;
+  const wig = Math.sin(player.animPhase) * 2;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.scale(player.flip ? -1 : 1, 1);
+
+  ctx.strokeStyle = '#20130b';
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < 3; i++) {
+    const lx = -6 + i * 6;
+    const k = i % 2 ? wig : -wig;
+    ctx.beginPath();
+    ctx.moveTo(lx, 0); ctx.lineTo(lx - 3, 6 + k);
+    ctx.moveTo(lx, 0); ctx.lineTo(lx - 3, -6 - k);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#241009';
+  dot(-7, 0, 6, 5);
+  dot(0, 0, 4, 3.5);
+  dot(7, 0, 3.6, 3.6);
+
+  ctx.strokeStyle = '#241009';
+  ctx.beginPath();
+  ctx.moveTo(9, -1); ctx.lineTo(13, -4);
+  ctx.moveTo(9, 1);  ctx.lineTo(13, 4);
+  ctx.stroke();
+
+  ctx.fillStyle = '#ffcf6b';
+  ctx.fillRect(10, -1.5, 3, 3);
+
+  if (dirtCarried > 0) {
+    ctx.fillStyle = '#7d5233';
+    ctx.beginPath();
+    ctx.arc(-9, -5, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+
+  function dot(x, y, rx, ry) {
+    ctx.beginPath();
+    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Underground gloom. EXTEND: swap the depth ramp for a lantern radius.
+function drawLighting() {
+  if (player.depth <= 2) return;
+  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.66;
+  const s = worldToScreen(player.x + player.w / 2, player.y + player.h / 2);
+  const R = 260 * cam.zoom;
+
+  const g = ctx.createRadialGradient(s.x, s.y, R * 0.18, s.x, s.y, R);
+  g.addColorStop(0.0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.6, `rgba(0,0,0,${k * 0.45})`);
+  g.addColorStop(1.0, `rgba(0,0,0,${k})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+}
+
+function drawHUD() {
+  ctx.font = '13px "Segoe UI", system-ui, sans-serif';
+  ctx.textBaseline = 'top';
+
+  const help = [
+    'ANTWORKS',
+    'WASD / Arrows   move',
+    'Space (face dirt)   dig',
+    'Click dirt   dig',
+    'F   fill tunnel (uses dirt)',
+    'Wheel  or  + / -   zoom',
+  ];
+  panel(10, 10, 210, help.length * 17 + 12);
+  help.forEach((line, i) => {
+    ctx.fillStyle = i === 0 ? '#ffcf6b' : '#e9e9e9';
+    ctx.fillText(line, 20, 18 + i * 17);
+  });
+
+  const stats = [
+    ['Tiles dug', tilesDug],
+    ['Dirt carried', dirtCarried],
+    ['Depth', player.depth],
+    ['Zoom', cam.zoom.toFixed(2) + 'x'],
+  ];
+  const pw = 176, rx = VIEW_W - pw - 10;
+  panel(rx, 10, pw, stats.length * 17 + 12);
+  stats.forEach(([label, val], i) => {
+    ctx.fillStyle = '#9fb4c8';
+    ctx.fillText(label, rx + 10, 18 + i * 17);
+    ctx.fillStyle = '#f2f2f2';
+    ctx.textAlign = 'right';
+    ctx.fillText(String(val), rx + pw - 10, 18 + i * 17);
+    ctx.textAlign = 'left';
+  });
+}
+
+function panel(x, y, w, h) {
+  ctx.fillStyle = 'rgba(15,12,10,0.68)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+}
+
+/* --- 12. LOOP + BOOTSTRAP -------------------------------------------------- */
+let last = 0;
+
+function frame(ts) {
+  nowMs = ts;
+  let dt = (ts - last) / 1000;
+  last = ts;
+  if (dt > 0.05) dt = 0.05;
+
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+function init() {
+  resize();
+  const spawn = generateWorld();
+  spawnPlayer(spawn.sx, spawn.sy);
+
+  cam.zoom = 1;
+  const vw = VIEW_W / cam.zoom, vh = VIEW_H / cam.zoom;
+  cam.x = clamp(player.x + player.w / 2 - vw / 2, 0, Math.max(0, MAP_PX_W - vw));
+  cam.y = clamp(player.y + player.h / 2 - vh / 2, 0, Math.max(0, MAP_PX_H - vh));
+
+  requestAnimationFrame(frame);
+}
+
+init();
+  </script>
+</body>
+</html>
