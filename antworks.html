@@ -7,14 +7,14 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+        href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap" />
   <style>
     html, body {
       margin: 0;
       height: 100%;
       overflow: hidden;
-      background: #123a5e;
-      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: #79c1e8;
+      font-family: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
     }
     #game { display: block; cursor: crosshair; }
   </style>
@@ -26,37 +26,35 @@
        a plain double-click. Edit the split version and regenerate this. -->
   <script>
 /* =========================================================================
-   ANTWORKS  —  a dig-'em-up about one ant and a great deal of dirt,
-   drawn as a working excavation blueprint.
+   ANTWORKS  —  a dig-and-build game about one ant and a great deal of dirt.
 
    HTML5 Canvas + vanilla JS. No build step: just open index.html.
 
    The surface and the underground are ONE continuous tile map. On or above
    the surface the ant is under a light gravity — it walks left/right and
-   settles onto the ground; up and down only AIM it (for digging), there is
-   no jump. Inside a tunnel or a cave it moves freely in every direction.
-   Dug tiles stay dug.
+   settles onto the ground; up and down only AIM it, there is no jump. Once
+   its centre is inside dug-out space below the surface it moves freely in
+   every direction. Dug tiles become open sky; you can pack a carried block
+   back into ANY empty tile — underground or up in the air.
 
    SECTION MAP:
-      1. CONFIG        tunable constants + blueprint palette
+      1. CONFIG        constants + palette
       2. CANVAS        context + responsive resize
       3. TILES         tile ids, lookup tables, grid helpers
-      4. WORLDGEN      procedural map: surface, dirt, rock, caves, water
+      4. WORLDGEN      procedural map: soil, rock, caves
       5. PLAYER        the ant: gravity-walk vs. free dig-move, collision
       6. INPUT         keyboard / mouse / wheel
       7. CAMERA        smooth follow + edge clamp + zoom
-      8. DIGGING       target selection + per-tile dig progress + back-fill
+      8. DIG & BUILD   excavate a tile / place a carried block anywhere
       9. PARTICLES     spoil flecks
      10. UPDATE        per-frame simulation
-     11. RENDER        blueprint sheet: grid, hatched tiles, ant, title block
+     11. RENDER        sky, layered soil, the ant, HUD
      12. LOOP          requestAnimationFrame + bootstrap
 
    WHERE TO EXTEND LATER  (search for  "EXTEND:"  inline):
      - food / resources ....... add a tile id + an overlap pickup in update()
      - other insects .......... entities[] + simple AI; reuse tileIsSolid()
-     - oxygen / light meter ... player.depth tracks how deep you are; drain a
-                                meter in update(), draw it in drawHUD(); the
-                                darkness ramp lives in drawLighting()
+     - oxygen / light meter ... player.depth tracks how deep you are
      - save / load ............ `grid` is a plain Int8Array
      - perf ................... cache the static tile layer to an offscreen canvas
    ========================================================================= */
@@ -73,16 +71,15 @@ const CFG = {
   SURFACE_ROW: 22,
 
   SPEED: 175,            // ant move speed, px/sec
-  WATER_SLOW: 0.6,
 
   GRAVITY: 1500,         // px/sec^2 — gentle; this is not a platformer
   MAX_FALL: 620,
-  STEP_UP: 40,           // px the ant will auto-climb over a one-tile lip while walking
+  STEP_UP: 40,           // px the ant auto-climbs over a one-tile lip while walking
 
-  DIG_TIME_DIRT: 0.45,   // seconds to break one dirt / grass tile
-  DIG_TIME_ROCK: 1.7,    // seconds to break one hard-rock tile
-  DIG_REACH: 1.7,        // tiles a mouse click may reach to dig
-  FILL_COOLDOWN: 0.14,
+  DIG_TIME_DIRT: 0.45,   // seconds to break one soil tile
+  DIG_TIME_ROCK: 1.7,    // seconds to break one rock tile
+  DIG_REACH: 1.8,        // tiles a mouse click may reach
+  BUILD_COOLDOWN: 0.11,  // seconds between placed blocks
 
   CAM_LERP: 9,
   ZOOM_MIN: 0.35,
@@ -90,16 +87,21 @@ const CFG = {
   ZOOM_STEP: 1.12,
 };
 
-// Blueprint palette — one committed visual world, so no light/dark theming.
-const BP = {
-  sky:    '#123a5e',   // base blueprint blue (above ground)
-  deep:   '#0c2a45',   // underground wash / vignette colour
-  void:   '#061424',   // an excavated tunnel: a drawn-out hollow
-  ink:    '#dbe9f4',   // chalk-white linework
-  inkDim: 'rgba(219,233,244,0.30)',
-  accent: '#8fdbcf',   // pale teal — headings, dig progress, the ant's heading pip
+// Warm daytime palette — one committed look, no light/dark theming.
+const C = {
+  skyTop:  '#3f97d1',
+  skyMid:  '#79c1e8',
+  skyLow:  '#c2e6f6',
+  dirtHi:  '#d59259',   // sun-warmed topsoil
+  dirtLow: '#7c4c2d',   // deep earth
+  rock:    '#6f7d8c',
+  rockHi:  '#93a0ae',
+  ink:     '#38240f',   // the ant
+  cream:   '#f7eedd',
+  gold:    '#f5c247',
+  panel:   'rgba(40,27,18,0.76)',
 };
-const MONO = '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
+const FONT = '"Nunito", system-ui, -apple-system, "Segoe UI", sans-serif';
 
 /* ---------------------------------------------------------------------------
    2. CANVAS
@@ -118,23 +120,16 @@ window.addEventListener('resize', resize);
 /* ---------------------------------------------------------------------------
    3. TILES
    ------------------------------------------------------------------------- */
-const T = {
-  AIR:    0,  // open sky above the ground line
-  GRASS:  1,  // the ground cap — solid, and diggable so you can sink a shaft
-  DIRT:   2,  // solid, diggable
-  ROCK:   3,  // solid, diggable but slow
-  WATER:  4,  // walkable, slows you down, not diggable
-  TUNNEL: 5,  // a tile that has been dug out — walkable
-};
+const T = { AIR: 0, DIRT: 1, ROCK: 2 };
 
-const SOLID    = { [T.GRASS]: 1, [T.DIRT]: 1, [T.ROCK]: 1 };
-const DIGGABLE = { [T.GRASS]: 1, [T.DIRT]: 1, [T.ROCK]: 1 };
+const SOLID    = { [T.DIRT]: 1, [T.ROCK]: 1 };
+const DIGGABLE = { [T.DIRT]: 1, [T.ROCK]: 1 };
 
 const MAP_PX_W = CFG.MAP_W * CFG.TILE;
 const MAP_PX_H = CFG.MAP_H * CFG.TILE;
 
 let grid;        // Int8Array, row-major:  index = ty * MAP_W + tx
-let surfaceAt;   // Int16Array[MAP_W]: ground row for each column
+let surfaceAt;   // Int16Array[MAP_W]: first solid row for each column
 
 const clamp    = (v, a, b) => (v < a ? a : v > b ? b : v);
 const inBounds = (tx, ty) => tx >= 0 && ty >= 0 && tx < CFG.MAP_W && ty < CFG.MAP_H;
@@ -152,7 +147,7 @@ function generateWorld() {
   grid = new Int8Array(CFG.MAP_W * CFG.MAP_H);
   surfaceAt = new Int16Array(CFG.MAP_W);
 
-  // 4a. rolling ground line + solid dirt underneath
+  // 4a. rolling ground line + solid soil beneath
   for (let tx = 0; tx < CFG.MAP_W; tx++) {
     const h = Math.round(
       CFG.SURFACE_ROW
@@ -161,14 +156,10 @@ function generateWorld() {
       + 1.5 * Math.sin(tx * 0.005 + 4.0)
     );
     surfaceAt[tx] = h;
-    for (let ty = 0; ty < CFG.MAP_H; ty++) {
-      if (ty < h)        setTile(tx, ty, T.AIR);
-      else if (ty === h) setTile(tx, ty, T.GRASS);
-      else               setTile(tx, ty, T.DIRT);
-    }
+    for (let ty = 0; ty < CFG.MAP_H; ty++) setTile(tx, ty, ty < h ? T.AIR : T.DIRT);
   }
 
-  // 4b. hard-rock blobs, deeper down
+  // 4b. rock veins, deeper down
   for (let i = 0; i < 90; i++) {
     const cx = 2 + ((Math.random() * (CFG.MAP_W - 4)) | 0);
     const minY = surfaceAt[cx] + 5;
@@ -180,7 +171,7 @@ function generateWorld() {
           setTile(cx + dx, cy + dy, T.ROCK);
   }
 
-  // 4c. pre-existing caves — carve with a wandering brush
+  // 4c. pre-existing hollows — carve with a wandering brush (they read as sky)
   for (let i = 0; i < 16; i++) {
     let cx = 8 + ((Math.random() * (CFG.MAP_W - 16)) | 0);
     let cy = surfaceAt[cx] + 8 + ((Math.random() * (CFG.MAP_H - surfaceAt[cx] - 14)) | 0);
@@ -189,48 +180,18 @@ function generateWorld() {
       carveBlob(cx, cy, 1 + ((Math.random() * 1.6) | 0));
       cx = clamp(cx + ((Math.random() * 3) | 0) - 1, 2, CFG.MAP_W - 3);
       cy += ((Math.random() * 3) | 0) - 1;
-      cy = clamp(cy, surfaceAt[cx] + 4, CFG.MAP_H - 3); // never breach the surface
+      cy = clamp(cy, surfaceAt[cx] + 4, CFG.MAP_H - 3); // stay well below the surface
     }
   }
 
-  // 4d. puddles in the surface dips
-  for (let tx = 3; tx < CFG.MAP_W - 3; tx++) {
-    if (surfaceAt[tx] > surfaceAt[tx - 1] &&
-        surfaceAt[tx] >= surfaceAt[tx + 1] &&
-        Math.random() < 0.25) {
-      const w = 1 + ((Math.random() * 3) | 0);
-      const d = 1 + ((Math.random() * 2) | 0);
-      for (let x = tx - w; x <= tx + w; x++) {
-        const base = surfaceAt[clamp(x, 0, CFG.MAP_W - 1)];
-        for (let y = base; y > base - d; y--) {
-          const t = getTile(x, y);
-          if (t === T.GRASS || t === T.AIR) setTile(x, y, T.WATER);
-        }
-      }
-    }
-  }
-
-  // 4e. keep the ground under the spawn whole and free of puddles
-  const sx = 12;
-  for (let dx = -3; dx <= 3; dx++) {
-    const col = sx + dx;
-    const g = surfaceAt[col];
-    for (let dy = 1; dy <= 4; dy++)
-      if (getTile(col, g - dy) === T.WATER) setTile(col, g - dy, T.AIR);
-    if (getTile(col, g) !== T.GRASS) setTile(col, g, T.GRASS);
-    if (!SOLID[getTile(col, g + 1)]) setTile(col, g + 1, T.DIRT);
-  }
-
-  return { sx, sy: surfaceAt[sx] - 1 };
+  return { sx: 12, sy: surfaceAt[12] - 1 };
 }
 
 function carveBlob(cx, cy, r) {
   for (let dy = -r; dy <= r; dy++)
     for (let dx = -r; dx <= r; dx++)
-      if (dx * dx + dy * dy <= r * r) {
-        const t = getTile(cx + dx, cy + dy);
-        if (t === T.DIRT || t === T.ROCK) setTile(cx + dx, cy + dy, T.TUNNEL);
-      }
+      if (dx * dx + dy * dy <= r * r && SOLID[getTile(cx + dx, cy + dy)])
+        setTile(cx + dx, cy + dy, T.AIR);
 }
 
 /* ---------------------------------------------------------------------------
@@ -239,10 +200,10 @@ function carveBlob(cx, cy, r) {
 const player = {
   x: 0, y: 0,
   w: 22, h: 14,
-  vy: 0,                 // fall speed (surface only)
-  face: { x: 1, y: 0 },  // last direction pressed — kept even when a wall blocks it
+  vy: 0,
+  face: { x: 1, y: 0 },   // last direction pressed, kept even when a wall blocks it
   flip: false,
-  underground: false,    // recomputed each frame: inside a tunnel/cave?
+  underground: false,
   depth: 0,
   animPhase: 0,
 };
@@ -263,37 +224,19 @@ function boxHitsSolid(px, py) {
   return false;
 }
 
-// What the ant can stand ON: solid ground, or the surface of a puddle. Used
-// only for the surface fall so the ant floats across water instead of
-// dropping through it into whatever's below (e.g. a cave under the pond).
-function boxHitsFloor(px, py) {
-  const x0 = Math.floor(px / CFG.TILE);
-  const y0 = Math.floor(py / CFG.TILE);
-  const x1 = Math.floor((px + player.w - 1) / CFG.TILE);
-  const y1 = Math.floor((py + player.h - 1) / CFG.TILE);
-  for (let ty = y0; ty <= y1; ty++)
-    for (let tx = x0; tx <= x1; tx++) {
-      const v = getTile(tx, ty);
-      if (SOLID[v] || v === T.WATER) return true;
-    }
-  return false;
-}
-
 const boxOverlapsTile = (tx, ty) => {
   const bx = tx * CFG.TILE, by = ty * CFG.TILE;
   return player.x < bx + CFG.TILE && player.x + player.w > bx &&
          player.y < by + CFG.TILE && player.y + player.h > by;
 };
 
-// Free movement (no gravity, dig in any direction) applies only when the ant
-// is actually inside dug-out / cave space — i.e. its centre is on a TUNNEL
-// tile. Everything else (sky, grass, standing on a puddle, momentarily sunk
-// into a rising step) is "surface": gravity + step-up. Keeping this to the
-// single TUNNEL test is what stops the ant wedging on terrain and ponds.
+// Free movement (no gravity, dig any direction) only once the ant's centre is
+// in open space strictly BELOW the natural ground line. Everything else — sky,
+// the very first dug row, a rising step it's briefly sunk into — is "surface".
 function isUnderground() {
   const cx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
   const cy = Math.floor((player.y + player.h / 2) / CFG.TILE);
-  return getTile(cx, cy) === T.TUNNEL;
+  return getTile(cx, cy) === T.AIR && cy > surfaceAt[cx];
 }
 
 function movePlayer(dt) {
@@ -305,19 +248,14 @@ function movePlayer(dt) {
   }
 
   player.underground = isUnderground();
-
-  const mcx = Math.floor((player.x + player.w / 2) / CFG.TILE);
-  const inWater = getTile(mcx, Math.floor((player.y + player.h / 2) / CFG.TILE)) === T.WATER ||
-                  getTile(mcx, Math.floor((player.y + player.h - 1) / CFG.TILE)) === T.WATER;
-  const speed = CFG.SPEED * (inWater ? CFG.WATER_SLOW : 1);
+  const step = CFG.SPEED * dt;
 
   // ---- horizontal ----
   if (ix) {
-    const dx = ix * speed * dt;
+    const dx = ix * step;
     if (!boxHitsSolid(player.x + dx, player.y)) {
       player.x += dx;
     } else if (!player.underground) {
-      // auto-climb a one-tile lip so strolling the rolling surface stays smooth
       for (let lift = 8; lift <= CFG.STEP_UP; lift += 8) {
         if (!boxHitsSolid(player.x + dx, player.y - lift)) {
           player.x += dx;
@@ -326,27 +264,25 @@ function movePlayer(dt) {
         }
       }
     }
-    player.animPhase += speed * dt * 0.09;
+    player.animPhase += step * 0.09;
   }
 
   // ---- vertical ----
   if (player.underground) {
     player.vy = 0;
     if (iy) {
-      const dy = iy * speed * dt;
+      const dy = iy * step;
       if (!boxHitsSolid(player.x, player.y + dy)) player.y += dy;
-      player.animPhase += speed * dt * 0.09;
+      player.animPhase += step * 0.09;
     }
   } else {
-    // gravity: settle onto the ground (or the surface of a puddle). Up/down
-    // don't move the ant here, they only aim it — there is no jump.
     player.vy = Math.min(player.vy + CFG.GRAVITY * dt, CFG.MAX_FALL);
     const dy = player.vy * dt;
-    if (!boxHitsFloor(player.x, player.y + dy)) {
+    if (!boxHitsSolid(player.x, player.y + dy)) {
       player.y += dy;
     } else {
-      let step = Math.max(1, Math.ceil(dy));
-      while (step-- > 0 && !boxHitsFloor(player.x, player.y + 1)) player.y += 1;
+      let s = Math.max(1, Math.ceil(dy));
+      while (s-- > 0 && !boxHitsSolid(player.x, player.y + 1)) player.y += 1;
       player.vy = 0;
     }
   }
@@ -354,7 +290,6 @@ function movePlayer(dt) {
   player.x = clamp(player.x, 0, MAP_PX_W - player.w);
   player.y = clamp(player.y, 0, MAP_PX_H - player.h);
 
-  // last-ditch un-stick, in case terrain ever closes around the ant
   let safety = CFG.TILE;
   while (safety-- > 0 && boxHitsSolid(player.x, player.y)) player.y -= 1;
 
@@ -406,33 +341,28 @@ function zoomBy(factor) {
 }
 
 function updateCamera(dt) {
-  const viewWunits = VIEW_W / cam.zoom;
-  const viewHunits = VIEW_H / cam.zoom;
-  const targetX = player.x + player.w / 2 - viewWunits / 2;
-  const targetY = player.y + player.h / 2 - viewHunits / 2;
-
+  const vw = VIEW_W / cam.zoom, vh = VIEW_H / cam.zoom;
+  const tx = player.x + player.w / 2 - vw / 2;
+  const ty = player.y + player.h / 2 - vh / 2;
   const t = 1 - Math.exp(-CFG.CAM_LERP * dt);
-  cam.x += (targetX - cam.x) * t;
-  cam.y += (targetY - cam.y) * t;
-
-  cam.x = clamp(cam.x, 0, Math.max(0, MAP_PX_W - viewWunits));
-  cam.y = clamp(cam.y, 0, Math.max(0, MAP_PX_H - viewHunits));
+  cam.x += (tx - cam.x) * t;
+  cam.y += (ty - cam.y) * t;
+  cam.x = clamp(cam.x, 0, Math.max(0, MAP_PX_W - vw));
+  cam.y = clamp(cam.y, 0, Math.max(0, MAP_PX_H - vh));
 }
 
 const worldToScreen = (wx, wy) => ({ x: (wx - cam.x) * cam.zoom, y: (wy - cam.y) * cam.zoom });
 const screenToWorld = (sx, sy) => ({ x: sx / cam.zoom + cam.x, y: sy / cam.zoom + cam.y });
-const scaleLabel = () => '1:' + Math.max(1, Math.round(24 / cam.zoom));
 
 /* ---------------------------------------------------------------------------
-   8. DIGGING  (and back-filling)
+   8. DIG & BUILD
    ------------------------------------------------------------------------- */
-const digProgress = new Map();   // "tx,ty" -> seconds worked so far (persists between visits)
+const digProgress = new Map();
 let digTarget = null;
 let tilesDug = 0;
-let dirtCarried = 0;
-let fillCooldown = 0;
+let blocks = 0;               // carried soil you can place
+let buildCooldown = 0;
 
-// The ant's aim as a unit-ish direction vector (never zero).
 function aimVec() {
   if (player.face.x || player.face.y) return player.face;
   return { x: player.flip ? -1 : 1, y: 0 };
@@ -452,10 +382,10 @@ function pickDigTarget() {
   }
   if (keys.has('space')) {
     const d = aimVec();
-    const probeX = player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35);
-    const probeY = player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35);
-    const tx = Math.floor(probeX / CFG.TILE);
-    const ty = Math.floor(probeY / CFG.TILE);
+    const px = player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35);
+    const py = player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35);
+    const tx = Math.floor(px / CFG.TILE);
+    const ty = Math.floor(py / CFG.TILE);
     if (DIGGABLE[getTile(tx, ty)]) return { tx, ty };
   }
   return null;
@@ -472,46 +402,47 @@ function updateDigging(dt) {
 
   if (worked >= need) {
     const wasRock = getTile(tx, ty) === T.ROCK;
-    setTile(tx, ty, T.TUNNEL);           // dug tiles stay dug
+    setTile(tx, ty, T.AIR);              // the hole shows the sky through
     digProgress.delete(key);
     tilesDug++;
-    dirtCarried += wasRock ? 2 : 1;
+    blocks += wasRock ? 2 : 1;
     puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, wasRock);
   } else {
     digProgress.set(key, worked);
   }
 }
 
-// Back-fill packs dirt into the one tunnel tile the ant is FACING. Held while
-// walking forward you'll wall yourself in — that's the natural consequence of
-// filling ahead; dig back through if you need to.
-function updateFill(dt) {
-  fillCooldown -= dt;
-  if (!keys.has('f') || dirtCarried <= 0 || fillCooldown > 0) return;
-
+// Tile the ant is aiming at, if a block could be placed there.
+function buildTargetTile() {
   const d = aimVec();
   const cx = Math.floor((player.x + player.w / 2) / CFG.TILE) + d.x;
   const cy = Math.floor((player.y + player.h / 2) / CFG.TILE) + d.y;
-  if (getTile(cx, cy) !== T.TUNNEL || boxOverlapsTile(cx, cy)) return;
+  if (getTile(cx, cy) === T.AIR && !boxOverlapsTile(cx, cy) && inBounds(cx, cy)) {
+    return { tx: cx, ty: cy };
+  }
+  return null;
+}
 
-  setTile(cx, cy, T.DIRT);
-  dirtCarried--;
+// F places a carried block into that tile — anywhere, sky or soil.
+function updateBuild(dt) {
+  buildCooldown -= dt;
+  if (!keys.has('f') || blocks <= 0 || buildCooldown > 0) return;
+  const tgt = buildTargetTile();
+  if (!tgt) return;
+  setTile(tgt.tx, tgt.ty, T.DIRT);
+  blocks--;
   tilesDug = Math.max(0, tilesDug - 1);
-  puff(cx * CFG.TILE + CFG.TILE / 2, cy * CFG.TILE + CFG.TILE / 2, false);
-  fillCooldown = CFG.FILL_COOLDOWN;
-
-  // if that fill left the ant clipping the new wall, ease it back out
-  let guard = CFG.TILE;
-  while (guard-- > 0 && boxHitsSolid(player.x, player.y)) player.x -= d.x;
+  puff(tgt.tx * CFG.TILE + CFG.TILE / 2, tgt.ty * CFG.TILE + CFG.TILE / 2, false);
+  buildCooldown = CFG.BUILD_COOLDOWN;
 }
 
 /* ---------------------------------------------------------------------------
-   9. PARTICLES  (spoil flecks on dig / fill)
+   9. PARTICLES
    ------------------------------------------------------------------------- */
 const particles = [];
 
 function puff(x, y, rock) {
-  const n = rock ? 16 : 11;
+  const n = rock ? 15 : 10;
   for (let i = 0; i < n; i++) {
     const a = Math.random() * Math.PI * 2;
     const sp = 20 + Math.random() * 70;
@@ -519,10 +450,11 @@ function puff(x, y, rock) {
       x, y,
       vx: Math.cos(a) * sp,
       vy: Math.sin(a) * sp - 20,
-      life: 0.5 + Math.random() * 0.4,
-      max: 0.9,
+      life: 0.45 + Math.random() * 0.4,
+      max: 0.85,
       r: 1.5 + Math.random() * 2,
       rot: Math.random() * Math.PI,
+      col: rock ? C.rockHi : (Math.random() < 0.5 ? C.dirtHi : C.dirtLow),
     });
   }
 }
@@ -530,7 +462,7 @@ function puff(x, y, rock) {
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
-    p.vy += 260 * dt;
+    p.vy += 300 * dt;
     p.x += p.vx * dt;
     p.y += p.vy * dt;
     p.vx *= (1 - 2.5 * dt);
@@ -545,101 +477,91 @@ function updateParticles(dt) {
 function update(dt) {
   movePlayer(dt);
   updateDigging(dt);
-  updateFill(dt);
+  updateBuild(dt);
   updateParticles(dt);
   updateCamera(dt);
 }
 
 /* ---------------------------------------------------------------------------
-   11. RENDER  —  a blueprint sheet
+   11. RENDER
    ------------------------------------------------------------------------- */
 
-// Pre-rendered 32x32 hatch stamps, built once. Drawing ~thousands of these
-// per frame is far cheaper than re-stroking hatching tile by tile.
-const STAMP = {};
+// hex "#rrggbb" -> "rgb(...)" blended
+function hexLerp(a, b, t) {
+  const A = parseInt(a.slice(1), 16), B = parseInt(b.slice(1), 16);
+  const ar = A >> 16, ag = (A >> 8) & 255, ab = A & 255;
+  const br = B >> 16, bg = (B >> 8) & 255, bb = B & 255;
+  return `rgb(${Math.round(ar + (br - ar) * t)},${Math.round(ag + (bg - ag) * t)},${Math.round(ab + (bb - ab) * t)})`;
+}
+
+// Pre-rendered 32x32 tile stamps: 6 soil depth-shades + 1 rock.
+const STAMP = { dirt: [] };
 function buildStamps() {
   const S = CFG.TILE;
   const mk = (draw) => {
     const c = document.createElement('canvas');
     c.width = c.height = S;
-    const g = c.getContext('2d');
-    draw(g, S);
+    draw(c.getContext('2d'), S);
     return c;
   };
 
-  STAMP[T.DIRT] = mk((g) => {
-    g.strokeStyle = BP.inkDim;
-    g.lineWidth = 1;
-    for (let i = -S; i < S; i += 6) { g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke(); }
-    g.strokeStyle = 'rgba(219,233,244,0.14)';
-    g.strokeRect(0.5, 0.5, S - 1, S - 1);
-  });
+  for (let b = 0; b < 6; b++) {
+    const t = b / 5;
+    STAMP.dirt[b] = mk((g) => {
+      g.fillStyle = hexLerp(C.dirtHi, C.dirtLow, t);
+      g.fillRect(0, 0, S, S);
+      g.fillStyle = 'rgba(255,239,214,0.16)';   // sunlit stratum line
+      g.fillRect(0, 0, S, 4);
+      g.fillStyle = 'rgba(48,28,14,0.20)';
+      g.fillRect(6, 10, 3, 3); g.fillRect(20, 7, 2, 2);
+      g.fillRect(13, 21, 3, 3); g.fillRect(25, 24, 2, 2);
+      g.fillStyle = 'rgba(255,239,214,0.07)';
+      g.fillRect(4, 17, 2, 2); g.fillRect(22, 15, 2, 2);
+    });
+  }
 
-  STAMP[T.ROCK] = mk((g) => {
-    g.strokeStyle = 'rgba(219,233,244,0.42)';
-    g.lineWidth = 1;
-    for (let i = -S; i < S; i += 5) {
-      g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke();
-      g.beginPath(); g.moveTo(i, 0); g.lineTo(i + S, S); g.stroke();
-    }
-    g.strokeStyle = 'rgba(219,233,244,0.55)';
+  STAMP.rock = mk((g) => {
+    g.fillStyle = C.rock;
+    g.fillRect(0, 0, S, S);
+    g.fillStyle = C.rockHi;
+    g.beginPath();
+    g.moveTo(4, S - 6); g.lineTo(12, 6); g.lineTo(S - 6, 10); g.lineTo(S - 4, S - 8);
+    g.closePath();
+    g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.10)';
+    g.fillRect(0, 0, S, 4);
+    g.strokeStyle = 'rgba(18,24,32,0.22)';
     g.lineWidth = 1;
     g.beginPath();
-    g.moveTo(S * 0.5, S * 0.2);
-    g.lineTo(S * 0.8, S * 0.5);
-    g.lineTo(S * 0.5, S * 0.8);
-    g.lineTo(S * 0.2, S * 0.5);
-    g.closePath();
+    g.moveTo(12, 6); g.lineTo(4, S - 6);
+    g.moveTo(12, 6); g.lineTo(S - 6, 10);
     g.stroke();
-  });
-
-  STAMP[T.GRASS] = mk((g) => {
-    g.strokeStyle = BP.inkDim;
-    g.lineWidth = 1;
-    for (let i = -S; i < S; i += 6) { g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke(); }
-    g.strokeStyle = BP.ink;
-    g.lineWidth = 1.5;
-    g.beginPath(); g.moveTo(0, 6); g.lineTo(S, 6); g.stroke();
-    g.lineWidth = 1;
-    for (let x = 3; x < S; x += 6) {
-      g.beginPath(); g.moveTo(x, 6.5); g.lineTo(x - 2.5, 0.5); g.stroke();
-      g.beginPath(); g.moveTo(x + 2.5, 6.5); g.lineTo(x + 4.5, 1.5); g.stroke();
-    }
-  });
-
-  STAMP[T.TUNNEL] = mk((g) => {
-    g.fillStyle = BP.void;
-    g.fillRect(0, 0, S, S);
-    g.strokeStyle = 'rgba(219,233,244,0.20)';
-    g.lineWidth = 1;
-    g.setLineDash([3, 3]);
-    g.strokeRect(0.5, 0.5, S - 1, S - 1);
-    g.setLineDash([]);
-  });
-
-  STAMP[T.WATER] = mk((g) => {
-    g.strokeStyle = 'rgba(143,219,207,0.75)';
-    g.lineWidth = 1.2;
-    for (let yy = 8; yy < S; yy += 9) {
-      g.beginPath();
-      for (let xx = 0; xx <= S; xx += 3) g.lineTo(xx, yy + Math.sin(xx * 0.7) * 1.7);
-      g.stroke();
-    }
+    g.fillStyle = 'rgba(18,24,32,0.22)';
+    g.fillRect(7, S - 11, 4, 4); g.fillRect(S - 12, S - 12, 3, 3);
   });
 }
 
 function render() {
-  // the sheet
-  ctx.fillStyle = BP.sky;
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  sky.addColorStop(0, C.skyTop);
+  sky.addColorStop(0.55, C.skyMid);
+  sky.addColorStop(1, C.skyLow);
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  const sun = ctx.createRadialGradient(VIEW_W * 0.83, VIEW_H * 0.14, 8, VIEW_W * 0.83, VIEW_H * 0.14, 260);
+  sun.addColorStop(0, 'rgba(255,250,235,0.33)');
+  sun.addColorStop(1, 'rgba(255,250,235,0)');
+  ctx.fillStyle = sun;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
   ctx.save();
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-cam.x, -cam.y);
 
-  drawGroundWash();
-  drawGrid();
   drawTiles();
+  drawBuildGhost();
   drawDigOverlay();
   drawParticles();
   drawAnt();
@@ -647,40 +569,7 @@ function render() {
   ctx.restore();
 
   drawLighting();
-  drawSheet();
   drawHUD();
-}
-
-// A darker blue below each column's ground line, so underground reads as "inside".
-function drawGroundWash() {
-  const S = CFG.TILE;
-  const x0 = Math.max(0, Math.floor(cam.x / S));
-  const x1 = Math.min(CFG.MAP_W - 1, Math.ceil((cam.x + VIEW_W / cam.zoom) / S));
-  const yBot = Math.min(MAP_PX_H, cam.y + VIEW_H / cam.zoom + S);
-  ctx.fillStyle = BP.deep;
-  for (let tx = x0; tx <= x1; tx++) {
-    const top = surfaceAt[tx] * S;
-    if (yBot > top) ctx.fillRect(tx * S, top, S, yBot - top);
-  }
-}
-
-// Graph-paper grid, world-locked, ~1px on screen at any zoom.
-function drawGrid() {
-  const S = CFG.TILE;
-  const lx0 = Math.floor(cam.x / S) * S;
-  const ly0 = Math.floor(cam.y / S) * S;
-  const lx1 = cam.x + VIEW_W / cam.zoom;
-  const ly1 = cam.y + VIEW_H / cam.zoom;
-  ctx.lineWidth = 1 / cam.zoom;
-
-  for (let x = lx0; x <= lx1; x += S) {
-    ctx.strokeStyle = (Math.round(x / S) % 4 === 0) ? 'rgba(219,233,244,0.15)' : 'rgba(219,233,244,0.06)';
-    ctx.beginPath(); ctx.moveTo(x, ly0 - S); ctx.lineTo(x, ly1 + S); ctx.stroke();
-  }
-  for (let y = ly0; y <= ly1; y += S) {
-    ctx.strokeStyle = (Math.round(y / S) % 4 === 0) ? 'rgba(219,233,244,0.15)' : 'rgba(219,233,244,0.06)';
-    ctx.beginPath(); ctx.moveTo(lx0 - S, y); ctx.lineTo(lx1 + S, y); ctx.stroke();
-  }
 }
 
 function drawTiles() {
@@ -694,9 +583,40 @@ function drawTiles() {
     for (let tx = x0; tx <= x1; tx++) {
       const v = grid[tIndex(tx, ty)];
       if (v === T.AIR) continue;
-      ctx.drawImage(STAMP[v], tx * S, ty * S);
+      const px = tx * S, py = ty * S;
+
+      if (v === T.ROCK) {
+        ctx.drawImage(STAMP.rock, px, py);
+      } else {
+        const band = clamp(Math.floor((ty - surfaceAt[tx]) / 8), 0, 5);
+        ctx.drawImage(STAMP.dirt[band], px, py);
+      }
+
+      // per-tile fleck so the tiling doesn't read as wallpaper
+      const tj = ((tx * 73856093) ^ (ty * 19349663)) >>> 0;
+      if (tj & 4) {
+        ctx.fillStyle = v === T.ROCK ? 'rgba(18,24,32,0.16)' : 'rgba(48,28,14,0.15)';
+        ctx.fillRect(px + (tj % 26), py + ((tj >> 5) % 26), 2, 2);
+      }
+      // soft rim of shade where soil meets open air above
+      if (getTile(tx, ty - 1) === T.AIR) {
+        ctx.fillStyle = 'rgba(0,0,0,0.10)';
+        ctx.fillRect(px, py, S, 3);
+      }
     }
   }
+}
+
+function drawBuildGhost() {
+  if (!keys.has('f') || blocks <= 0) return;
+  const tgt = buildTargetTile();
+  if (!tgt) return;
+  const S = CFG.TILE;
+  ctx.fillStyle = 'rgba(213,146,89,0.4)';
+  ctx.fillRect(tgt.tx * S + 3, tgt.ty * S + 3, S - 6, S - 6);
+  ctx.strokeStyle = 'rgba(247,238,221,0.85)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(tgt.tx * S + 3, tgt.ty * S + 3, S - 6, S - 6);
 }
 
 function drawDigOverlay() {
@@ -708,41 +628,38 @@ function drawDigOverlay() {
     const f = clamp(worked / need, 0, 1);
     const mx = tx * S + S / 2, my = ty * S + S / 2;
 
-    ctx.strokeStyle = 'rgba(219,233,244,0.55)';
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = 'rgba(247,238,221,0.8)';
+    ctx.lineWidth = 1.6;
     for (let a = 0; a < 6; a++) {
       const th = (a / 6) * Math.PI * 2 + 0.3;
       ctx.beginPath();
       ctx.moveTo(mx, my);
-      ctx.lineTo(mx + Math.cos(th) * S * 0.42 * f, my + Math.sin(th) * S * 0.42 * f);
+      ctx.lineTo(mx + Math.cos(th) * S * 0.4 * f, my + Math.sin(th) * S * 0.4 * f);
       ctx.stroke();
     }
-    ctx.strokeStyle = BP.accent;
-    ctx.lineWidth = 2;
+    ctx.strokeStyle = C.gold;
+    ctx.lineWidth = 3;
     ctx.beginPath();
-    ctx.arc(mx, my, S * 0.34, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
+    ctx.arc(mx, my, S * 0.33, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
     ctx.stroke();
   }
 
   if (digTarget) {
-    ctx.strokeStyle = BP.ink;
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([4, 3]);
-    ctx.strokeRect(digTarget.tx * S + 1.5, digTarget.ty * S + 1.5, S - 3, S - 3);
-    ctx.setLineDash([]);
+    ctx.strokeStyle = 'rgba(247,238,221,0.9)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(digTarget.tx * S + 2, digTarget.ty * S + 2, S - 4, S - 4);
   }
 }
 
 function drawParticles() {
-  ctx.strokeStyle = BP.ink;
-  ctx.lineWidth = 1;
   for (const p of particles) {
-    ctx.globalAlpha = clamp(p.life / p.max, 0, 1) * 0.9;
-    const c = Math.cos(p.rot) * p.r, s = Math.sin(p.rot) * p.r;
-    ctx.beginPath();
-    ctx.moveTo(p.x - c, p.y - s);
-    ctx.lineTo(p.x + c, p.y + s);
-    ctx.stroke();
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.col;
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot + (p.max - p.life) * 7);
+    ctx.fillRect(-p.r, -p.r, p.r * 2, p.r * 2);
+    ctx.restore();
   }
   ctx.globalAlpha = 1;
 }
@@ -752,25 +669,6 @@ function drawAnt() {
   const cy = player.y + player.h / 2;
   const wig = Math.sin(player.animPhase) * 2;
 
-  // a drafting "survey target" so the ant is always findable on a busy sheet
-  ctx.save();
-  ctx.translate(cx, cy);
-  ctx.strokeStyle = 'rgba(143,219,207,0.5)';
-  ctx.lineWidth = 1;
-  ctx.setLineDash([2, 4]);
-  ctx.beginPath();
-  ctx.arc(0, 0, 20, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.strokeStyle = 'rgba(143,219,207,0.28)';
-  ctx.beginPath();
-  ctx.moveTo(-26, 0); ctx.lineTo(-20, 0);
-  ctx.moveTo(20, 0);  ctx.lineTo(26, 0);
-  ctx.moveTo(0, -26); ctx.lineTo(0, -20);
-  ctx.moveTo(0, 20);  ctx.lineTo(0, 26);
-  ctx.stroke();
-  ctx.restore();
-
   let fx = player.face.x, fy = player.face.y;
   if (!fx && !fy) { fx = player.flip ? -1 : 1; fy = 0; }
   const ang = Math.atan2(fy, fx);
@@ -778,147 +676,125 @@ function drawAnt() {
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(ang);
-  if (Math.cos(ang) < -0.001) ctx.scale(1, -1);   // keep the belly down when facing left
+  if (Math.cos(ang) < -0.001) ctx.scale(1, -1);
   ctx.scale(1.15, 1.15);
-
-  ctx.strokeStyle = BP.ink;
-  ctx.lineWidth = 1.5;
   ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
 
-  for (let i = 0; i < 3; i++) {
-    const lx = -6 + i * 6;
-    const k = i % 2 ? wig : -wig;
-    ctx.beginPath();
-    ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, 7 + k);
-    ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, -7 - k);
-    ctx.stroke();
-  }
+  const legs = () => {
+    for (let i = 0; i < 3; i++) {
+      const lx = -6 + i * 6;
+      const k = i % 2 ? wig : -wig;
+      ctx.beginPath();
+      ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, 7 + k);
+      ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, -7 - k);
+      ctx.stroke();
+    }
+  };
+  ctx.strokeStyle = C.cream; ctx.lineWidth = 3.6; legs();
+  ctx.strokeStyle = C.ink;   ctx.lineWidth = 1.7; legs();
 
-  strokeEllipse(-7, 0, 6, 5);
-  strokeEllipse(0, 0, 4, 3.6);
-  strokeEllipse(7, 0, 3.8, 3.8);
+  const body = () => {
+    ctx.moveTo(-0.6, 0);  ctx.ellipse(-7, 0, 6.4, 5.4, 0, 0, Math.PI * 2);
+    ctx.moveTo(4.2, 0);   ctx.ellipse(0, 0, 4.2, 3.8, 0, 0, Math.PI * 2);
+    ctx.moveTo(11, 0);    ctx.ellipse(7, 0, 4, 4, 0, 0, Math.PI * 2);
+  };
+  ctx.strokeStyle = C.cream; ctx.lineWidth = 3;
+  ctx.beginPath(); body(); ctx.stroke();
+  ctx.fillStyle = C.ink;
+  ctx.beginPath(); body(); ctx.fill();
 
+  ctx.strokeStyle = C.ink; ctx.lineWidth = 1.7;
   ctx.beginPath();
   ctx.moveTo(9, -1.6); ctx.lineTo(13.5, -5);
   ctx.moveTo(9, 1.6);  ctx.lineTo(13.5, 5);
   ctx.stroke();
 
-  ctx.fillStyle = BP.accent;
-  ctx.beginPath();
-  ctx.moveTo(10.5, 0); ctx.lineTo(14.5, -2.6); ctx.lineTo(14.5, 2.6);
-  ctx.closePath();
-  ctx.fill();
+  ctx.fillStyle = C.gold;
+  ctx.beginPath(); ctx.arc(11.5, 0, 2.3, 0, Math.PI * 2); ctx.fill();
 
-  if (dirtCarried > 0) {
-    ctx.strokeStyle = BP.ink;
-    ctx.strokeRect(-12, -8.5, 5, 5);
+  if (blocks > 0) {
+    ctx.fillStyle = C.dirtHi;
+    ctx.strokeStyle = C.cream;
+    ctx.lineWidth = 1.4;
+    ctx.fillRect(-12.5, -9, 5.5, 5.5);
+    ctx.strokeRect(-12.5, -9, 5.5, 5.5);
   }
 
   ctx.restore();
-
-  function strokeEllipse(x, y, rx, ry) {
-    ctx.beginPath();
-    ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
-    ctx.stroke();
-  }
 }
 
-// Going deep, the sheet darkens to deep navy around a lamp-lit disc.
+// Going deep, a warm shadow closes in around a lamp-lit disc.
 function drawLighting() {
-  if (player.depth <= 2) return;
-  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.7;
+  if (player.depth <= 3) return;
+  const k = clamp((player.depth - 3) / 34, 0, 1) * 0.6;
   const s = worldToScreen(player.x + player.w / 2, player.y + player.h / 2);
-  const R = 280 * cam.zoom;
-
-  const g = ctx.createRadialGradient(s.x, s.y, R * 0.15, s.x, s.y, R);
-  g.addColorStop(0.0, 'rgba(6,20,36,0)');
-  g.addColorStop(0.6, `rgba(6,20,36,${k * 0.5})`);
-  g.addColorStop(1.0, `rgba(6,20,36,${k})`);
+  const R = 300 * cam.zoom;
+  const g = ctx.createRadialGradient(s.x, s.y, R * 0.16, s.x, s.y, R);
+  g.addColorStop(0.0, 'rgba(22,12,6,0)');
+  g.addColorStop(0.55, `rgba(22,12,6,${k * 0.45})`);
+  g.addColorStop(1.0, `rgba(22,12,6,${k})`);
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 }
 
-// Drawing-sheet border + drafting title block, bottom-right.
-function drawSheet() {
-  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+  else ctx.rect(x, y, w, h);
+}
+function panel(x, y, w, h) {
+  ctx.fillStyle = C.panel;
+  rr(x, y, w, h, 12); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.10)';
   ctx.lineWidth = 1;
-  ctx.strokeRect(10.5, 10.5, VIEW_W - 21, VIEW_H - 21);
-  ctx.lineWidth = 2;
-  ctx.strokeRect(16.5, 16.5, VIEW_W - 33, VIEW_H - 33);
-
-  const bw = Math.min(264, VIEW_W - 60);
-  const bh = 66;
-  const bx = VIEW_W - 17 - bw;
-  const by = VIEW_H - 17 - bh;
-
-  ctx.fillStyle = 'rgba(12,42,69,0.9)';
-  ctx.fillRect(bx, by, bw, bh);
-  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(bx + 0.5, by + 0.5, bw, bh);
-  ctx.beginPath(); ctx.moveTo(bx, by + 27.5); ctx.lineTo(bx + bw, by + 27.5); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(bx + bw * 0.6, by + 27.5); ctx.lineTo(bx + bw * 0.6, by + bh); ctx.stroke();
-
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = BP.ink;
-  ctx.font = '600 14px ' + MONO;
-  ctx.fillText('A N T W O R K S', bx + 12, by + 19);
-  ctx.font = '10px ' + MONO;
-  ctx.fillStyle = 'rgba(219,233,244,0.72)';
-  ctx.fillText('COLONY EXCAVATION', bx + 12, by + 44);
-  ctx.fillText('SHEET 1 / 1', bx + 12, by + 57);
-  ctx.fillText('SCALE ' + scaleLabel(), bx + bw * 0.6 + 12, by + 44);
-  ctx.fillText('DEPTH ' + player.depth + ' u', bx + bw * 0.6 + 12, by + 57);
+  rr(x + 0.5, y + 0.5, w - 1, h - 1, 11.5); ctx.stroke();
 }
 
 function drawHUD() {
-  ctx.textBaseline = 'top';
+  ctx.textBaseline = 'alphabetic';
 
-  annPanel(26, 26, 300, 'LEGEND', [
-    'WASD / ARROWS  ..  move & aim',
-    'SPACE (aim at soil)  excavate',
-    'CLICK a tile  ....  excavate',
-    'F (aim at tunnel)   back-fill',
-    'WHEEL  /  + −  ...  scale',
-  ]);
+  // controls, top-left
+  const cw = 236, ch = 128;
+  panel(16, 16, cw, ch);
+  ctx.fillStyle = C.gold;
+  ctx.font = '800 17px ' + FONT;
+  ctx.fillText('ANTWORKS', 32, 42);
+  const rows = [
+    ['Move / aim', 'WASD'],
+    ['Dig', 'Space / click'],
+    ['Place block', 'F'],
+    ['Zoom', 'wheel · + −'],
+  ];
+  ctx.font = '600 12.5px ' + FONT;
+  rows.forEach(([a, b], i) => {
+    const y = 66 + i * 16;
+    ctx.fillStyle = 'rgba(247,238,221,0.6)';
+    ctx.textAlign = 'left';
+    ctx.fillText(a, 32, y);
+    ctx.fillStyle = C.cream;
+    ctx.textAlign = 'right';
+    ctx.fillText(b, 16 + cw - 16, y);
+  });
+  ctx.textAlign = 'left';
 
-  const pw = 210;
-  annPanel(VIEW_W - 26 - pw, 26, pw, 'SURVEY', [
-    'EXCAVATED   ' + tilesDug,
-    'SPOIL LOAD  ' + dirtCarried,
-    'DEPTH       ' + player.depth + ' u',
-    'SCALE       ' + scaleLabel(),
-  ]);
-}
-
-function annPanel(x, y, w, title, lines) {
-  const pad = 11, lh = 16;
-  const h = pad + 20 + lines.length * lh + pad - 4;
-
-  ctx.fillStyle = 'rgba(12,42,69,0.85)';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
-  ctx.lineWidth = 1;
-  ctx.strokeRect(x + 0.5, y + 0.5, w, h);
-
-  ctx.beginPath();
-  for (const [ex, ey] of [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]) {
-    ctx.moveTo(ex - 4, ey); ctx.lineTo(ex + 4, ey);
-    ctx.moveTo(ex, ey - 4); ctx.lineTo(ex, ey + 4);
-  }
-  ctx.stroke();
-
-  ctx.fillStyle = BP.accent;
-  ctx.font = '10px ' + MONO;
-  ctx.fillText(title, x + pad, y + pad);
-  ctx.strokeStyle = 'rgba(219,233,244,0.28)';
-  ctx.beginPath();
-  ctx.moveTo(x + pad, y + pad + 15); ctx.lineTo(x + w - pad, y + pad + 15);
-  ctx.stroke();
-
-  ctx.fillStyle = BP.ink;
-  ctx.font = '11px ' + MONO;
-  lines.forEach((t, i) => ctx.fillText(t, x + pad, y + pad + 22 + i * lh));
+  // stats, top-right
+  const sw = 148, sh = 102;
+  const sx = VIEW_W - 16 - sw;
+  panel(sx, 16, sw, sh);
+  const stats = [['DUG', tilesDug], ['BLOCKS', blocks], ['DEPTH', player.depth]];
+  stats.forEach(([a, b], i) => {
+    const y = 46 + i * 26;
+    ctx.font = '700 11px ' + FONT;
+    ctx.fillStyle = 'rgba(247,238,221,0.58)';
+    ctx.textAlign = 'left';
+    ctx.fillText(a, sx + 16, y);
+    ctx.font = '800 18px ' + FONT;
+    ctx.fillStyle = C.cream;
+    ctx.textAlign = 'right';
+    ctx.fillText(String(b), sx + sw - 16, y);
+  });
+  ctx.textAlign = 'left';
 }
 
 /* ---------------------------------------------------------------------------
@@ -930,7 +806,6 @@ function frame(ts) {
   let dt = (ts - last) / 1000;
   last = ts;
   if (dt > 0.05) dt = 0.05;
-
   update(dt);
   render();
   requestAnimationFrame(frame);
@@ -948,7 +823,8 @@ function init() {
   cam.y = clamp(player.y + player.h / 2 - vh / 2, 0, Math.max(0, MAP_PX_H - vh));
 
   if (document.fonts && document.fonts.load) {
-    document.fonts.load('11px "IBM Plex Mono"').catch(() => {});
+    document.fonts.load('700 15px "Nunito"').catch(() => {});
+    document.fonts.load('800 15px "Nunito"').catch(() => {});
   }
   requestAnimationFrame(frame);
 }
