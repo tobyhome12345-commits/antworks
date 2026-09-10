@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Antworks</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #8ec7e6;          /* sky — matches the canvas backdrop */
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    #game {
+      display: block;
+      image-rendering: pixelated;   /* keep the chunky look crisp */
+      cursor: crosshair;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <!-- Single script, no build step. Structured internally into labelled sections;
+       split into player.js / world.js / renderer.js / input.js later if it grows. -->
+  <script src="game.js"></script>
+</body>
+</html>
