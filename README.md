@@ -19,26 +19,33 @@ HTML5 Canvas + vanilla JavaScript. **No build step.**
 
 | Action | Keys |
 | --- | --- |
-| Move (8-way, no gravity) | `W` `A` `S` `D` or arrow keys |
-| Dig the tile you're facing | hold `Space` |
+| Move & aim | `W` `A` `S` `D` or arrow keys |
+| Dig the tile you're aiming at | hold `Space` |
 | Dig a specific tile | click it (must be within reach) |
 | Pack dirt back into a tunnel | hold `F` (spends carried dirt) |
 | Zoom | mouse wheel, or `+` / `-` |
 
-The HUD shows tiles dug, dirt carried, current depth, and zoom.
+On the **surface** the ant walks the terrain silhouette — left/right only;
+up/down just aim it for digging, so it never flies off the ground. Once it's
+**underground** (in a tunnel or a cave) it moves freely in every direction.
+
+The HUD shows tiles dug, dirt carried, twigs collected, current depth, and zoom.
 
 ## How the world works
 
 - **32 px tiles**, map is **220 × 110** tiles.
-- **Surface** (top ~20%): grass, twigs, boulders, puddles. Walkable, *not* diggable.
-  Water slows you down.
+- **Surface** (top ~20%): rolling grass with **twigs** to collect (walk over them)
+  and **puddles** that slow you while you wade.
 - **Underground**: solid **dirt** everywhere, with **hard-rock** veins (slower to
   dig) and a scattering of **pre-existing caves** for variety.
+- The grass cap is solid but *diggable* — sink a shaft straight down through it
+  to get underground.
 - Digging a tile takes time — a radial progress ring shows on the tile, and
-  partial progress persists if you wander off and come back. Dirt ≈ 0.45 s,
+  partial progress persists if you wander off and come back. Dirt/grass ≈ 0.45 s,
   rock ≈ 1.7 s.
 - Every tile you break becomes permanent open **tunnel** and drops dirt into your
-  carry count (rock gives 2). Hold `F` facing a tunnel to fill it back in.
+  carry count (rock gives 2). Hold `F` to pack dirt back in — aim at a tunnel
+  while standing still, or hold it while walking to seal the passage behind you.
 - The deeper you go, the more the light closes in around you.
 
 ## Files

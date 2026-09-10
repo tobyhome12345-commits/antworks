@@ -2,16 +2,17 @@
    ANTWORKS  —  a tiny dig-'em-up about one ant and a great deal of dirt.
    HTML5 Canvas + vanilla JS. No build step: just open index.html.
 
-   The surface and the underground are ONE continuous tile map. Above the
-   ground line is walkable open air / terrain; below it is solid dirt and
-   rock you can tunnel through. Dug tiles stay dug.
+   The surface and the underground are ONE continuous tile map. On the
+   surface the ant walks the terrain silhouette and cannot fly up off it.
+   Underground — inside tunnels it has dug or found — it moves freely in
+   all directions. Dug tiles stay dug.
 
    SECTION MAP (all in this file; pull apart into modules later if it grows):
       1. CONFIG        tunable constants
       2. CANVAS        context + responsive resize
       3. TILES         tile ids, lookup tables, grid helpers
-      4. WORLDGEN      procedural map: surface, dirt, rock, caves, water
-      5. PLAYER        the ant: state, movement, tile collision
+      4. WORLDGEN      procedural map: surface, dirt, rock, caves, water, twigs
+      5. PLAYER        the ant: facing, surface walk vs. free dig-move, collision
       6. INPUT         keyboard / mouse / wheel
       7. CAMERA        smooth follow + edge clamp + zoom
       8. DIGGING       target selection + per-tile dig progress + back-fill
@@ -21,11 +22,12 @@
      12. LOOP          requestAnimationFrame + bootstrap
 
    WHERE TO EXTEND LATER  (search for  "EXTEND:"  inline):
-     - food / resources ....... add tile ids or an entities[] array; collect in update()
+     - food / resources ....... twigs already show the pattern: a tile id, an
+                                overlap pickup in update(), a HUD counter
      - other insects .......... entities[] + simple AI; reuse tileIsSolid() for walls
-     - oxygen / light meter ... player.depth already tracks how deep you are;
-                                drain a meter in update(), draw it in drawHUD();
-                                the darkness effect lives in drawLighting()
+     - oxygen / light meter ... player.depth tracks how deep you are; drain a
+                                meter in update(), draw it in drawHUD(); the
+                                darkness ramp lives in drawLighting()
      - save / load ............ `grid` is a plain Int8Array:
                                 localStorage.setItem('save', JSON.stringify([...grid]))
      - perf ................... cache the static tile layer to an offscreen canvas
@@ -45,10 +47,13 @@ const CFG = {
   SPEED: 175,            // ant walk speed, px/sec — snappy, not floaty
   WATER_SLOW: 0.6,       // movement multiplier while wading
 
-  DIG_TIME_DIRT: 0.45,   // seconds to break one dirt tile
+  SETTLE_DOWN: 1000,     // px/sec the ant drops back to ground level on the surface
+  SETTLE_UP: 1600,       // px/sec the ant clambers up a rise in the terrain
+
+  DIG_TIME_DIRT: 0.45,   // seconds to break one dirt / grass tile
   DIG_TIME_ROCK: 1.7,    // seconds to break one hard-rock tile
   DIG_REACH: 1.7,        // tiles: how far a mouse click may reach to dig
-  FILL_COOLDOWN: 0.16,   // seconds between back-fill placements
+  FILL_COOLDOWN: 0.14,   // seconds between back-fill placements
 
   CAM_LERP: 9,           // camera follow stiffness (higher = snappier)
   ZOOM_MIN: 0.35,
@@ -74,41 +79,41 @@ window.addEventListener('resize', resize);
    3. TILES
    ------------------------------------------------------------------------- */
 const T = {
-  AIR:     0,  // open sky above the ground line
-  GRASS:   1,  // the ground cap — walkable, not diggable
-  DIRT:    2,  // solid, diggable
-  ROCK:    3,  // solid, diggable but slow
-  WATER:   4,  // walkable, slows you down, not diggable
-  STICK:   5,  // surface decoration, walkable
-  TUNNEL:  6,  // a tile that has been dug out — walkable
-  BOULDER: 7,  // surface obstacle — solid, not diggable
+  AIR:    0,  // open sky above the ground line
+  GRASS:  1,  // the ground cap — solid, and diggable so you can sink a shaft
+  DIRT:   2,  // solid, diggable
+  ROCK:   3,  // solid, diggable but slow
+  WATER:  4,  // walkable, slows you down, not diggable
+  TWIG:   5,  // surface pickup — walk over it to collect
+  TUNNEL: 6,  // a tile that has been dug out — walkable
 };
 
-// Tiles that block movement.
-const SOLID = { [T.DIRT]: 1, [T.ROCK]: 1, [T.BOULDER]: 1 };
+// Tiles that block movement (only enforced while the ant is underground /
+// free-moving; on the surface the ant rides the terrain instead).
+const SOLID = { [T.GRASS]: 1, [T.DIRT]: 1, [T.ROCK]: 1 };
 // Tiles a shovel can remove (-> TUNNEL).
-const DIGGABLE = { [T.DIRT]: 1, [T.ROCK]: 1 };
+const DIGGABLE = { [T.GRASS]: 1, [T.DIRT]: 1, [T.ROCK]: 1 };
 
 const MAP_PX_W = CFG.MAP_W * CFG.TILE;
 const MAP_PX_H = CFG.MAP_H * CFG.TILE;
 
 let grid;        // Int8Array, row-major:  index = ty * MAP_W + tx
-let surfaceAt;   // Int16Array[MAP_W]: ground row for each column (depth + sky/tunnel test)
+let surfaceAt;   // Int16Array[MAP_W]: ground row for each column
 
-const clamp   = (v, a, b) => (v < a ? a : v > b ? b : v);
+const clamp    = (v, a, b) => (v < a ? a : v > b ? b : v);
 const inBounds = (tx, ty) => tx >= 0 && ty >= 0 && tx < CFG.MAP_W && ty < CFG.MAP_H;
-const tIndex  = (tx, ty) => ty * CFG.MAP_W + tx;
+const tIndex   = (tx, ty) => ty * CFG.MAP_W + tx;
 
 // Out-of-bounds reads as solid DIRT so the ant can never leave the map.
-const getTile = (tx, ty) => (inBounds(tx, ty) ? grid[tIndex(tx, ty)] : T.DIRT);
-const setTile = (tx, ty, v) => { if (inBounds(tx, ty)) grid[tIndex(tx, ty)] = v; };
+const getTile     = (tx, ty) => (inBounds(tx, ty) ? grid[tIndex(tx, ty)] : T.DIRT);
+const setTile     = (tx, ty, v) => { if (inBounds(tx, ty)) grid[tIndex(tx, ty)] = v; };
 const tileIsSolid = (tx, ty) => !!SOLID[getTile(tx, ty)];
 
 /* ---------------------------------------------------------------------------
    4. WORLDGEN
    Everything below SURFACE is DIRT to begin with; we then stamp in rock
    blobs, carve some pre-existing caves, pour a few puddles, and scatter
-   surface clutter. Returns the tile the ant should spawn on.
+   twigs to collect. Returns the tile the ant should spawn on.
    ------------------------------------------------------------------------- */
 function generateWorld() {
   grid = new Int8Array(CFG.MAP_W * CFG.MAP_H);
@@ -135,7 +140,7 @@ function generateWorld() {
     const cx = 2 + ((Math.random() * (CFG.MAP_W - 4)) | 0);
     const minY = surfaceAt[cx] + 5;
     const cy = minY + ((Math.random() * (CFG.MAP_H - minY - 2)) | 0);
-    const r = 2 + ((Math.random() * 2) | 0);   // 2..3 — rounder blobs, not plus-signs
+    const r = 2 + ((Math.random() * 2) | 0);   // 2..3 — rounded blobs
     for (let dy = -r; dy <= r; dy++)
       for (let dx = -r; dx <= r; dx++)
         if (dx * dx + dy * dy <= r * r && getTile(cx + dx, cy + dy) === T.DIRT)
@@ -172,24 +177,27 @@ function generateWorld() {
     }
   }
 
-  // 4e. surface clutter — twigs (walkable) and boulders (obstacles)
+  // 4e. twigs sitting on the grass — walk over them to collect
   for (let tx = 1; tx < CFG.MAP_W - 1; tx++) {
     const g = surfaceAt[tx];
-    if (getTile(tx, g) !== T.GRASS) continue;      // skip columns that became water
-    const roll = Math.random();
-    if (roll < 0.05)      setTile(tx, g - 1, T.BOULDER);
-    else if (roll < 0.20) setTile(tx, g - 1, T.STICK);
+    if (getTile(tx, g) === T.GRASS && Math.random() < 0.12) setTile(tx, g - 1, T.TWIG);
   }
 
-  // 4f. clear a little pocket so the ant never spawns buried or boxed in
+  // 4f. clear a clean pocket at the spawn — strip twigs / stray water from the
+  //     air above the ground, but keep the ground itself whole (never punch a
+  //     hole in the grass cap, or the ant sinks in beside its own start point)
   const sx = 12;
-  const sy = surfaceAt[sx] - 1;
-  for (let dy = -2; dy <= 1; dy++)
-    for (let dx = -2; dx <= 2; dx++) {
-      const t = getTile(sx + dx, sy + dy);
-      if (t === T.BOULDER || t === T.STICK || t === T.WATER)
-        setTile(sx + dx, sy + dy, T.AIR);
+  for (let dx = -3; dx <= 3; dx++) {
+    const col = sx + dx;
+    const g = surfaceAt[col];
+    for (let dy = 1; dy <= 4; dy++) {
+      const t = getTile(col, g - dy);
+      if (t === T.TWIG || t === T.WATER) setTile(col, g - dy, T.AIR);
     }
+    if (getTile(col, g) !== T.GRASS) setTile(col, g, T.GRASS);
+    if (!SOLID[getTile(col, g + 1)]) setTile(col, g + 1, T.DIRT);
+  }
+  const sy = surfaceAt[sx] - 1;
 
   return { sx, sy };
 }
@@ -206,17 +214,26 @@ function carveBlob(cx, cy, r) {
 
 /* ---------------------------------------------------------------------------
    5. PLAYER  (the ant)
-   No gravity: the ant moves freely through any non-solid tile, on the
-   surface or in tunnels. Collision is a simple AABB-vs-tiles test, resolved
-   one axis at a time so you slide along walls instead of sticking.
+
+   Two movement modes, chosen every frame by computeFreeMove():
+     - SURFACE  : walk left/right along the terrain silhouette. The ant is
+                  eased to sit on top of its column, so it can't fly up into
+                  the sky and can't sink through the grass. Up/down only aim
+                  the ant (for digging), they don't move it.
+     - FREE-MOVE: once the ant is inside a tunnel or below the ground line,
+                  it moves in all directions; solid tiles block it.
+
+   `face` is the last direction pressed, kept even when a wall stops the
+   move, so Space / click always digs where the ant is pointing.
    ------------------------------------------------------------------------- */
 const player = {
   x: 0, y: 0,
   w: 22, h: 14,
-  face: { x: 1, y: 0 },   // last non-zero input direction (for Space-digging)
-  flip: false,            // drawing: true = facing left
-  depth: 0,               // tiles below the local surface (0 on top)
-  animPhase: 0,           // leg-wiggle clock, advances only while walking
+  face: { x: 1, y: 0 },
+  flip: false,          // last horizontal facing (fallback for dig aim)
+  freeMove: false,      // surface walk vs. underground free movement
+  depth: 0,             // tiles below the local surface (0 on top)
+  animPhase: 0,         // leg-wiggle clock, advances only while walking
 };
 
 function spawnPlayer(tx, ty) {
@@ -242,28 +259,70 @@ const boxOverlapsTile = (tx, ty) => {
          player.y < by + CFG.TILE && player.y + player.h > by;
 };
 
+// Is the ant underground (free movement) or on the surface (terrain walk)?
+// It's underground only when it's actually inside open dug/cave space — being
+// momentarily sunk into a solid tile (e.g. climbing a rising step in the
+// terrain) must NOT count, or the ant wedges itself in the dirt.
+function computeFreeMove() {
+  const cx   = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
+  const cyC  = Math.floor((player.y + player.h / 2) / CFG.TILE);
+  const here = getTile(cx, cyC);
+
+  if (here === T.TUNNEL) return true;                  // inside a dug tunnel or a cave
+  // climbing a shaft back to daylight: stay free while a tunnel is right below
+  if (player.freeMove && !SOLID[here]) {
+    const cyB = Math.floor((player.y + player.h + 3) / CFG.TILE);
+    if (getTile(cx, cyB) === T.TUNNEL) return true;
+  }
+  return false;
+}
+
 function movePlayer(dt) {
-  const ix = (keyDown('a', 'arrowleft') ? -1 : 0) + (keyDown('d', 'arrowright') ? 1 : 0);
-  const iy = (keyDown('w', 'arrowup')   ? -1 : 0) + (keyDown('s', 'arrowdown')  ? 1 : 0);
+  const rawX = (keyDown('d', 'arrowright') ? 1 : 0) - (keyDown('a', 'arrowleft') ? 1 : 0);
+  const rawY = (keyDown('s', 'arrowdown')  ? 1 : 0) - (keyDown('w', 'arrowup')   ? 1 : 0);
 
-  if (ix || iy) {
-    const inv = 1 / Math.hypot(ix, iy);         // normalise so diagonals aren't faster
-    player.face = { x: Math.sign(ix), y: Math.sign(iy) };
-    if (ix) player.flip = ix < 0;
+  // Aim the ant. Happens even if a wall blocks the move, so you can always
+  // face — and dig — downward, upward, or diagonally.
+  if (rawX || rawY) {
+    player.face = { x: Math.sign(rawX), y: Math.sign(rawY) };
+    if (rawX) player.flip = rawX < 0;
+  }
 
-    // wading through water is slower
-    const ct = getTile(
-      Math.floor((player.x + player.w / 2) / CFG.TILE),
-      Math.floor((player.y + player.h / 2) / CFG.TILE)
-    );
-    const step = CFG.SPEED * (ct === T.WATER ? CFG.WATER_SLOW : 1) * dt;
+  player.freeMove = computeFreeMove();
 
-    const nx = player.x + ix * inv * step;
-    const ny = player.y + iy * inv * step;
+  const centreTile = getTile(
+    Math.floor((player.x + player.w / 2) / CFG.TILE),
+    Math.floor((player.y + player.h / 2) / CFG.TILE)
+  );
+  const speed = CFG.SPEED * (centreTile === T.WATER ? CFG.WATER_SLOW : 1);
+
+  if (player.freeMove) {
+    // --- underground: free 8-way movement, solid tiles block, no gravity ---
+    let mx = rawX, my = rawY;
+    if (mx && my) { mx *= Math.SQRT1_2; my *= Math.SQRT1_2; }
+    const nx = player.x + mx * speed * dt;
+    const ny = player.y + my * speed * dt;
     if (!boxHitsSolid(nx, player.y)) player.x = nx;
     if (!boxHitsSolid(player.x, ny)) player.y = ny;
+    if (mx || my) player.animPhase += speed * dt * 0.09;
+  } else {
+    // --- surface: stroll the terrain outline; you cannot rise off it ---
+    if (rawX) {
+      player.x += rawX * speed * dt;
+      player.animPhase += speed * dt * 0.09;
+    }
+    player.x = clamp(player.x, 0, MAP_PX_W - player.w);
 
-    player.animPhase += step * 0.09;
+    // find the true top of this column — always scan DOWN from above the ground
+    // line, so the ant climbs terrain that rises into it instead of ploughing
+    // through. Rest on the first solid tile, or on the surface of a puddle
+    // (waded across, not sunk into).
+    const cx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
+    let gr = Math.max(0, surfaceAt[cx] - 4);
+    while (gr < CFG.MAP_H && !tileIsSolid(cx, gr) && getTile(cx, gr) !== T.WATER) gr++;
+    const restY = gr * CFG.TILE - player.h;
+    if (player.y < restY)      player.y = Math.min(restY, player.y + CFG.SETTLE_DOWN * dt);
+    else if (player.y > restY) player.y = Math.max(restY, player.y - CFG.SETTLE_UP * dt);
   }
 
   player.x = clamp(player.x, 0, MAP_PX_W - player.w);
@@ -273,6 +332,21 @@ function movePlayer(dt) {
   const ptx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
   const pfy = Math.floor((player.y + player.h) / CFG.TILE);
   player.depth = Math.max(0, pfy - surfaceAt[ptx]);
+}
+
+// Walk over a twig to pick it up.
+function collectTwigs() {
+  const x0 = Math.floor(player.x / CFG.TILE);
+  const y0 = Math.floor(player.y / CFG.TILE);
+  const x1 = Math.floor((player.x + player.w - 1) / CFG.TILE);
+  const y1 = Math.floor((player.y + player.h - 1) / CFG.TILE);
+  for (let ty = y0; ty <= y1; ty++)
+    for (let tx = x0; tx <= x1; tx++)
+      if (getTile(tx, ty) === T.TWIG) {
+        setTile(tx, ty, T.AIR);
+        twigs++;
+        puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, false);
+      }
 }
 
 /* ---------------------------------------------------------------------------
@@ -314,7 +388,6 @@ const cam = { x: 0, y: 0, zoom: 1 };
 
 function zoomBy(factor) {
   cam.zoom = clamp(cam.zoom * factor, CFG.ZOOM_MIN, CFG.ZOOM_MAX);
-  // never let the visible area exceed the map
   cam.zoom = Math.max(cam.zoom, VIEW_W / MAP_PX_W, VIEW_H / MAP_PX_H);
 }
 
@@ -342,6 +415,7 @@ const digProgress = new Map();   // "tx,ty" -> seconds worked so far (persists b
 let digTarget = null;            // {tx,ty} being worked this frame (for the overlay)
 let tilesDug = 0;
 let dirtCarried = 0;             // EXTEND: cap this, make heavy loads slow you, drop piles...
+let twigs = 0;
 let fillCooldown = 0;
 
 // Which tile are we digging this frame? Mouse-click wins; otherwise held Space.
@@ -360,8 +434,7 @@ function pickDigTarget() {
   }
   // (b) Space: the tile directly ahead of the ant's face
   if (keys.has('space')) {
-    const d = (player.face.x || player.face.y) ? player.face
-                                              : { x: player.flip ? -1 : 1, y: 0 };
+    const d = aimVec();
     const probeX = player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35);
     const probeY = player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35);
     const tx = Math.floor(probeX / CFG.TILE);
@@ -369,6 +442,12 @@ function pickDigTarget() {
     if (DIGGABLE[getTile(tx, ty)]) return { tx, ty };
   }
   return null;
+}
+
+// The ant's aim as a direction vector (never zero).
+function aimVec() {
+  if (player.face.x || player.face.y) return player.face;
+  return { x: player.flip ? -1 : 1, y: 0 };
 }
 
 function updateDigging(dt) {
@@ -392,27 +471,47 @@ function updateDigging(dt) {
   }
 }
 
-// Hold F, facing an open tunnel tile, to pack dirt back into it.
+// The tile a back-fill should go into. Standing still, you fill the tile you
+// aim at. While walking, you seal the tunnel *behind* you as you retreat — and
+// a tile you're actively pressing into is never chosen, so a fill can't wall
+// the ant in on top of itself.
+function fillTargetTile() {
+  const cx = Math.floor((player.x + player.w / 2) / CFG.TILE);
+  const cy = Math.floor((player.y + player.h / 2) / CFG.TILE);
+  const d = aimVec();
+  const walking = keyDown('a', 'arrowleft', 'd', 'arrowright', 'w', 'arrowup', 's', 'arrowdown');
+  const pressingInto = (ox, oy) =>
+    (ox > 0 && keyDown('d', 'arrowright')) || (ox < 0 && keyDown('a', 'arrowleft')) ||
+    (oy > 0 && keyDown('s', 'arrowdown'))  || (oy < 0 && keyDown('w', 'arrowup'));
+
+  const cands = walking
+    ? [[-d.x, -d.y], [0, 1], [d.x, d.y], [0, -1], [1, 0], [-1, 0]]   // behind first
+    : [[d.x, d.y], [0, 1], [-d.x, -d.y], [0, -1], [1, 0], [-1, 0]];  // aimed first
+
+  for (const [ox, oy] of cands) {
+    if ((!ox && !oy) || pressingInto(ox, oy)) continue;
+    const tx = cx + ox, ty = cy + oy;
+    if (getTile(tx, ty) === T.TUNNEL && !boxOverlapsTile(tx, ty)) return { tx, ty };
+  }
+  return null;
+}
+
 function updateFill(dt) {
   fillCooldown -= dt;
   if (!keys.has('f') || dirtCarried <= 0 || fillCooldown > 0) return;
 
-  const d = (player.face.x || player.face.y) ? player.face
-                                            : { x: player.flip ? -1 : 1, y: 0 };
-  const tx = Math.floor((player.x + player.w / 2 + d.x * (player.w / 2 + CFG.TILE * 0.35)) / CFG.TILE);
-  const ty = Math.floor((player.y + player.h / 2 + d.y * (player.h / 2 + CFG.TILE * 0.35)) / CFG.TILE);
+  const tgt = fillTargetTile();
+  if (!tgt) return;
 
-  if (getTile(tx, ty) === T.TUNNEL && !boxOverlapsTile(tx, ty)) {
-    setTile(tx, ty, T.DIRT);
-    dirtCarried--;
-    tilesDug = Math.max(0, tilesDug - 1);
-    puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, false);
-    fillCooldown = CFG.FILL_COOLDOWN;
-  }
+  setTile(tgt.tx, tgt.ty, T.DIRT);
+  dirtCarried--;
+  tilesDug = Math.max(0, tilesDug - 1);
+  puff(tgt.tx * CFG.TILE + CFG.TILE / 2, tgt.ty * CFG.TILE + CFG.TILE / 2, false);
+  fillCooldown = CFG.FILL_COOLDOWN;
 }
 
 /* ---------------------------------------------------------------------------
-   9. PARTICLES  (dirt puffs on a successful dig / fill)
+   9. PARTICLES  (dirt puffs on dig / fill / twig pickup)
    ------------------------------------------------------------------------- */
 const particles = [];
 
@@ -450,6 +549,7 @@ function updateParticles(dt) {
    ------------------------------------------------------------------------- */
 function update(dt) {
   movePlayer(dt);
+  collectTwigs();
   updateDigging(dt);
   updateFill(dt);
   updateParticles(dt);
@@ -470,7 +570,6 @@ function tileTint(tx, ty) {
 }
 
 function render() {
-  // sky backdrop; underground tiles paint over it
   ctx.fillStyle = '#8ec7e6';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
@@ -544,22 +643,21 @@ function drawTiles() {
           break;
         }
 
-        case T.STICK:
-          ctx.strokeStyle = rgb(110, 74, 42);
-          ctx.lineWidth = 2;
+        case T.TWIG: {
+          // a small forked twig lying on the grass
+          ctx.strokeStyle = rgb(122, 84, 48);
+          ctx.lineWidth = 2.5;
+          ctx.lineCap = 'round';
+          const bx = px + 7, by = py + S - 8;
           ctx.beginPath();
-          ctx.moveTo(px + 6, py + S - 6);
-          ctx.lineTo(px + S - 6, py + S - 15);
+          ctx.moveTo(bx, by);
+          ctx.lineTo(bx + 15, by - 9);
+          ctx.moveTo(bx + 9, by - 5.4);
+          ctx.lineTo(bx + 14, by - 1);
           ctx.stroke();
+          ctx.lineCap = 'butt';
           break;
-
-        case T.BOULDER:
-          ctx.fillStyle = rgb(112, 112, 118);
-          ctx.beginPath();
-          ctx.arc(px + S / 2, py + S / 2 + 5, S / 2 - 2, Math.PI, 0);
-          ctx.fill();
-          ctx.fillRect(px + 2, py + S / 2 + 4, S - 4, S / 2 - 2);
-          break;
+        }
       }
     }
   }
@@ -607,9 +705,16 @@ function drawAnt() {
   const cy = player.y + player.h / 2;
   const wig = Math.sin(player.animPhase) * 2;
 
+  // point the whole ant along its aim vector; when it faces left-ish, mirror
+  // vertically so the belly stays down instead of drawing upside-down
+  let fx = player.face.x, fy = player.face.y;
+  if (!fx && !fy) { fx = player.flip ? -1 : 1; fy = 0; }
+  const ang = Math.atan2(fy, fx);
+
   ctx.save();
   ctx.translate(cx, cy);
-  ctx.scale(player.flip ? -1 : 1, 1);   // head points along +x, i.e. the facing direction
+  ctx.rotate(ang);
+  if (Math.cos(ang) < -0.001) ctx.scale(1, -1);
 
   // 6 legs
   ctx.strokeStyle = '#20130b';
@@ -623,7 +728,7 @@ function drawAnt() {
     ctx.stroke();
   }
 
-  // body: gaster (rear), thorax, head
+  // body: gaster (rear), thorax, head — head sits at +x, i.e. the aim direction
   ctx.fillStyle = '#241009';
   dot(-7, 0, 6, 5);
   dot(0, 0, 4, 3.5);
@@ -661,12 +766,10 @@ function drawAnt() {
 // ramping up with depth. EXTEND: swap `player.depth` ramp for a lantern radius.
 function drawLighting() {
   if (player.depth <= 2) return;
-  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.66;   // ramps to 0.66 max darkness
+  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.66;
   const s = worldToScreen(player.x + player.w / 2, player.y + player.h / 2);
   const R = 260 * cam.zoom;
 
-  // one radial gradient over the whole screen; beyond R it clamps to solid `k`,
-  // so the corners go dark on their own — no extra rectangles needed.
   const g = ctx.createRadialGradient(s.x, s.y, R * 0.18, s.x, s.y, R);
   g.addColorStop(0.0, 'rgba(0,0,0,0)');
   g.addColorStop(0.6, `rgba(0,0,0,${k * 0.45})`);
@@ -682,13 +785,13 @@ function drawHUD() {
   // controls (top-left)
   const help = [
     'ANTWORKS',
-    'WASD / Arrows   move',
-    'Space (face dirt)   dig',
+    'WASD / Arrows   move & aim',
+    'Space (aim at dirt)   dig',
     'Click dirt   dig',
-    'F   fill tunnel (uses dirt)',
+    'F   fill a tunnel (uses dirt)',
     'Wheel  or  + / -   zoom',
   ];
-  panel(10, 10, 210, help.length * 17 + 12);
+  panel(10, 10, 220, help.length * 17 + 12);
   help.forEach((line, i) => {
     ctx.fillStyle = i === 0 ? '#ffcf6b' : '#e9e9e9';
     ctx.fillText(line, 20, 18 + i * 17);
@@ -698,6 +801,7 @@ function drawHUD() {
   const stats = [
     ['Tiles dug', tilesDug],
     ['Dirt carried', dirtCarried],
+    ['Twigs', twigs],
     ['Depth', player.depth],
     ['Zoom', cam.zoom.toFixed(2) + 'x'],
   ];
