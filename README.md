@@ -8,10 +8,12 @@ HTML5 Canvas + vanilla JavaScript. **No build step.**
 
 ## Run it
 
-Open `index.html` in any modern browser. That's it.
-
-(If your browser blocks `file://` scripts, serve the folder over HTTP — any
-static server works, e.g. the VS Code "Live Server" extension.)
+- **Just want to play:** open **`antworks.html`** — one self-contained file,
+  double-click it, done.
+- **Want to hack on it:** open **`index.html`** (loads `game.js` beside it).
+  Keep both files together in the same folder. `game.js` is the file to edit;
+  `antworks.html` is `index.html` + `game.js` welded together and should be
+  regenerated when you change them.
 
 ## Controls
 
@@ -42,8 +44,9 @@ The HUD shows tiles dug, dirt carried, current depth, and zoom.
 ## Files
 
 ```
-index.html    canvas + page shell
-game.js       everything else, in 12 labelled sections:
+antworks.html  single-file build (generated) — the one to just play
+index.html     canvas + page shell
+game.js        everything else, in 12 labelled sections:
               CONFIG · CANVAS · TILES · WORLDGEN · PLAYER · INPUT ·
               CAMERA · DIGGING · PARTICLES · UPDATE · RENDER · LOOP
 ```
