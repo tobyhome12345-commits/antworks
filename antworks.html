@@ -4,68 +4,106 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Antworks</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
   <style>
     html, body {
       margin: 0;
       height: 100%;
       overflow: hidden;
-      background: #8ec7e6;
-      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #123a5e;
+      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
     }
-    #game { display: block; image-rendering: pixelated; cursor: crosshair; }
+    #game { display: block; cursor: crosshair; }
   </style>
 </head>
 <body>
   <canvas id="game"></canvas>
 
-  <!-- ======================================================================
-       SINGLE-FILE BUILD. index.html + game.js combined into one file so it
-       runs from a plain double-click with nothing else alongside it. The
-       split version (index.html + game.js) is the one to edit; regenerate
-       this file from it, or keep the two in sync by hand.
-       ====================================================================== -->
+  <!-- Single-file build: index.html + game.js welded together so it runs from
+       a plain double-click. Edit the split version and regenerate this. -->
   <script>
 /* =========================================================================
-   ANTWORKS  —  a tiny dig-'em-up about one ant and a great deal of dirt.
-   HTML5 Canvas + vanilla JS, no libraries.
+   ANTWORKS  —  a dig-'em-up about one ant and a great deal of dirt,
+   drawn as a working excavation blueprint.
 
-   The surface and the underground are ONE continuous tile map. On the
-   surface the ant walks the terrain silhouette and cannot fly up off it.
-   Underground — inside tunnels it has dug or found — it moves freely in
-   all directions. Dug tiles stay dug.
+   HTML5 Canvas + vanilla JS. No build step: just open index.html.
+
+   The surface and the underground are ONE continuous tile map. On or above
+   the surface the ant is under a light gravity — it walks left/right and
+   settles onto the ground; up and down only AIM it (for digging), there is
+   no jump. Inside a tunnel or a cave it moves freely in every direction.
+   Dug tiles stay dug.
 
    SECTION MAP:
-      1. CONFIG   2. CANVAS   3. TILES   4. WORLDGEN   5. PLAYER   6. INPUT
-      7. CAMERA   8. DIGGING  9. PARTICLES  10. UPDATE  11. RENDER  12. LOOP
+      1. CONFIG        tunable constants + blueprint palette
+      2. CANVAS        context + responsive resize
+      3. TILES         tile ids, lookup tables, grid helpers
+      4. WORLDGEN      procedural map: surface, dirt, rock, caves, water
+      5. PLAYER        the ant: gravity-walk vs. free dig-move, collision
+      6. INPUT         keyboard / mouse / wheel
+      7. CAMERA        smooth follow + edge clamp + zoom
+      8. DIGGING       target selection + per-tile dig progress + back-fill
+      9. PARTICLES     spoil flecks
+     10. UPDATE        per-frame simulation
+     11. RENDER        blueprint sheet: grid, hatched tiles, ant, title block
+     12. LOOP          requestAnimationFrame + bootstrap
+
+   WHERE TO EXTEND LATER  (search for  "EXTEND:"  inline):
+     - food / resources ....... add a tile id + an overlap pickup in update()
+     - other insects .......... entities[] + simple AI; reuse tileIsSolid()
+     - oxygen / light meter ... player.depth tracks how deep you are; drain a
+                                meter in update(), draw it in drawHUD(); the
+                                darkness ramp lives in drawLighting()
+     - save / load ............ `grid` is a plain Int8Array
+     - perf ................... cache the static tile layer to an offscreen canvas
    ========================================================================= */
 
 'use strict';
 
-/* --- 1. CONFIG --------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   1. CONFIG
+   ------------------------------------------------------------------------- */
 const CFG = {
-  TILE: 32,              // px per tile
-  MAP_W: 220,            // tiles wide
-  MAP_H: 110,            // tiles tall
-  SURFACE_ROW: 22,       // baseline ground row (~20% down the map)
+  TILE: 32,
+  MAP_W: 220,
+  MAP_H: 110,
+  SURFACE_ROW: 22,
 
-  SPEED: 175,            // ant walk speed, px/sec — snappy, not floaty
-  WATER_SLOW: 0.6,       // movement multiplier while wading
+  SPEED: 175,            // ant move speed, px/sec
+  WATER_SLOW: 0.6,
 
-  SETTLE_DOWN: 1000,     // px/sec the ant drops back to ground level on the surface
-  SETTLE_UP: 1600,       // px/sec the ant clambers up a rise in the terrain
+  GRAVITY: 1500,         // px/sec^2 — gentle; this is not a platformer
+  MAX_FALL: 620,
+  STEP_UP: 40,           // px the ant will auto-climb over a one-tile lip while walking
 
   DIG_TIME_DIRT: 0.45,   // seconds to break one dirt / grass tile
   DIG_TIME_ROCK: 1.7,    // seconds to break one hard-rock tile
-  DIG_REACH: 1.7,        // tiles: how far a mouse click may reach to dig
-  FILL_COOLDOWN: 0.14,   // seconds between back-fill placements
+  DIG_REACH: 1.7,        // tiles a mouse click may reach to dig
+  FILL_COOLDOWN: 0.14,
 
-  CAM_LERP: 9,           // camera follow stiffness (higher = snappier)
+  CAM_LERP: 9,
   ZOOM_MIN: 0.35,
   ZOOM_MAX: 2.5,
-  ZOOM_STEP: 1.12,       // multiply/divide per wheel notch or +/- press
+  ZOOM_STEP: 1.12,
 };
 
-/* --- 2. CANVAS ------------------------------------------------------------ */
+// Blueprint palette — one committed visual world, so no light/dark theming.
+const BP = {
+  sky:    '#123a5e',   // base blueprint blue (above ground)
+  deep:   '#0c2a45',   // underground wash / vignette colour
+  void:   '#061424',   // an excavated tunnel: a drawn-out hollow
+  ink:    '#dbe9f4',   // chalk-white linework
+  inkDim: 'rgba(219,233,244,0.30)',
+  accent: '#8fdbcf',   // pale teal — headings, dig progress, the ant's heading pip
+};
+const MONO = '"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
+
+/* ---------------------------------------------------------------------------
+   2. CANVAS
+   ------------------------------------------------------------------------- */
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 let VIEW_W = 0, VIEW_H = 0;
@@ -77,15 +115,16 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 
-/* --- 3. TILES ---------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   3. TILES
+   ------------------------------------------------------------------------- */
 const T = {
   AIR:    0,  // open sky above the ground line
   GRASS:  1,  // the ground cap — solid, and diggable so you can sink a shaft
   DIRT:   2,  // solid, diggable
   ROCK:   3,  // solid, diggable but slow
   WATER:  4,  // walkable, slows you down, not diggable
-  TWIG:   5,  // surface pickup — walk over it to collect
-  TUNNEL: 6,  // a tile that has been dug out — walkable
+  TUNNEL: 5,  // a tile that has been dug out — walkable
 };
 
 const SOLID    = { [T.GRASS]: 1, [T.DIRT]: 1, [T.ROCK]: 1 };
@@ -106,10 +145,9 @@ const getTile     = (tx, ty) => (inBounds(tx, ty) ? grid[tIndex(tx, ty)] : T.DIR
 const setTile     = (tx, ty, v) => { if (inBounds(tx, ty)) grid[tIndex(tx, ty)] = v; };
 const tileIsSolid = (tx, ty) => !!SOLID[getTile(tx, ty)];
 
-/* --- 4. WORLDGEN ----------------------------------------------------------
-   Fill below the surface with DIRT, then stamp rock blobs, carve caves,
-   pour puddles, scatter twigs to collect. Returns the tile the ant spawns on.
-   -------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   4. WORLDGEN
+   ------------------------------------------------------------------------- */
 function generateWorld() {
   grid = new Int8Array(CFG.MAP_W * CFG.MAP_H);
   surfaceAt = new Int16Array(CFG.MAP_W);
@@ -135,7 +173,7 @@ function generateWorld() {
     const cx = 2 + ((Math.random() * (CFG.MAP_W - 4)) | 0);
     const minY = surfaceAt[cx] + 5;
     const cy = minY + ((Math.random() * (CFG.MAP_H - minY - 2)) | 0);
-    const r = 2 + ((Math.random() * 2) | 0);   // 2..3 — rounded blobs
+    const r = 2 + ((Math.random() * 2) | 0);
     for (let dy = -r; dy <= r; dy++)
       for (let dx = -r; dx <= r; dx++)
         if (dx * dx + dy * dy <= r * r && getTile(cx + dx, cy + dy) === T.DIRT)
@@ -172,29 +210,18 @@ function generateWorld() {
     }
   }
 
-  // 4e. twigs sitting on the grass — walk over them to collect
-  for (let tx = 1; tx < CFG.MAP_W - 1; tx++) {
-    const g = surfaceAt[tx];
-    if (getTile(tx, g) === T.GRASS && Math.random() < 0.12) setTile(tx, g - 1, T.TWIG);
-  }
-
-  // 4f. clean pocket at the spawn — strip twigs / stray water from the air
-  //     above the ground, but keep the ground itself whole (never punch a
-  //     hole in the grass cap, or the ant sinks in beside its own start)
+  // 4e. keep the ground under the spawn whole and free of puddles
   const sx = 12;
   for (let dx = -3; dx <= 3; dx++) {
     const col = sx + dx;
     const g = surfaceAt[col];
-    for (let dy = 1; dy <= 4; dy++) {
-      const t = getTile(col, g - dy);
-      if (t === T.TWIG || t === T.WATER) setTile(col, g - dy, T.AIR);
-    }
+    for (let dy = 1; dy <= 4; dy++)
+      if (getTile(col, g - dy) === T.WATER) setTile(col, g - dy, T.AIR);
     if (getTile(col, g) !== T.GRASS) setTile(col, g, T.GRASS);
     if (!SOLID[getTile(col, g + 1)]) setTile(col, g + 1, T.DIRT);
   }
-  const sy = surfaceAt[sx] - 1;
 
-  return { sx, sy };
+  return { sx, sy: surfaceAt[sx] - 1 };
 }
 
 function carveBlob(cx, cy, r) {
@@ -206,21 +233,16 @@ function carveBlob(cx, cy, r) {
       }
 }
 
-/* --- 5. PLAYER (the ant) -----------------------------------------------
-   Two modes, chosen each frame by computeFreeMove():
-     SURFACE   — walk left/right along the terrain silhouette; eased onto
-                 the top of the column so it can't fly up or sink through.
-                 Up/down only AIM the ant (for digging).
-     FREE-MOVE — once inside a tunnel/cave, move in all directions; solids block.
-   `face` is the last direction pressed, kept even when a wall blocks the
-   move, so Space / click always digs where the ant is pointing.
-   -------------------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   5. PLAYER  (the ant)
+   ------------------------------------------------------------------------- */
 const player = {
   x: 0, y: 0,
   w: 22, h: 14,
-  face: { x: 1, y: 0 },
+  vy: 0,                 // fall speed (surface only)
+  face: { x: 1, y: 0 },  // last direction pressed — kept even when a wall blocks it
   flip: false,
-  freeMove: false,
+  underground: false,    // recomputed each frame: inside a tunnel/cave?
   depth: 0,
   animPhase: 0,
 };
@@ -241,95 +263,109 @@ function boxHitsSolid(px, py) {
   return false;
 }
 
+// What the ant can stand ON: solid ground, or the surface of a puddle. Used
+// only for the surface fall so the ant floats across water instead of
+// dropping through it into whatever's below (e.g. a cave under the pond).
+function boxHitsFloor(px, py) {
+  const x0 = Math.floor(px / CFG.TILE);
+  const y0 = Math.floor(py / CFG.TILE);
+  const x1 = Math.floor((px + player.w - 1) / CFG.TILE);
+  const y1 = Math.floor((py + player.h - 1) / CFG.TILE);
+  for (let ty = y0; ty <= y1; ty++)
+    for (let tx = x0; tx <= x1; tx++) {
+      const v = getTile(tx, ty);
+      if (SOLID[v] || v === T.WATER) return true;
+    }
+  return false;
+}
+
 const boxOverlapsTile = (tx, ty) => {
   const bx = tx * CFG.TILE, by = ty * CFG.TILE;
   return player.x < bx + CFG.TILE && player.x + player.w > bx &&
          player.y < by + CFG.TILE && player.y + player.h > by;
 };
 
-// Underground (free movement) or on the surface (terrain walk)? Only "inside
-// open dug/cave space" counts — being momentarily sunk into a solid tile while
-// climbing a rise must NOT, or the ant wedges itself in the dirt.
-function computeFreeMove() {
-  const cx   = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
-  const cyC  = Math.floor((player.y + player.h / 2) / CFG.TILE);
-  const here = getTile(cx, cyC);
-
-  if (here === T.TUNNEL) return true;
-  if (player.freeMove && !SOLID[here]) {
-    const cyB = Math.floor((player.y + player.h + 3) / CFG.TILE);
-    if (getTile(cx, cyB) === T.TUNNEL) return true;   // at a shaft mouth, climbing out
-  }
-  return false;
+// Free movement (no gravity, dig in any direction) applies only when the ant
+// is actually inside dug-out / cave space — i.e. its centre is on a TUNNEL
+// tile. Everything else (sky, grass, standing on a puddle, momentarily sunk
+// into a rising step) is "surface": gravity + step-up. Keeping this to the
+// single TUNNEL test is what stops the ant wedging on terrain and ponds.
+function isUnderground() {
+  const cx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
+  const cy = Math.floor((player.y + player.h / 2) / CFG.TILE);
+  return getTile(cx, cy) === T.TUNNEL;
 }
 
 function movePlayer(dt) {
-  const rawX = (keyDown('d', 'arrowright') ? 1 : 0) - (keyDown('a', 'arrowleft') ? 1 : 0);
-  const rawY = (keyDown('s', 'arrowdown')  ? 1 : 0) - (keyDown('w', 'arrowup')   ? 1 : 0);
-
-  if (rawX || rawY) {
-    player.face = { x: Math.sign(rawX), y: Math.sign(rawY) };
-    if (rawX) player.flip = rawX < 0;
+  const ix = (keyDown('d', 'arrowright') ? 1 : 0) - (keyDown('a', 'arrowleft') ? 1 : 0);
+  const iy = (keyDown('s', 'arrowdown')  ? 1 : 0) - (keyDown('w', 'arrowup')   ? 1 : 0);
+  if (ix || iy) {
+    player.face = { x: Math.sign(ix), y: Math.sign(iy) };
+    if (ix) player.flip = ix < 0;
   }
 
-  player.freeMove = computeFreeMove();
+  player.underground = isUnderground();
 
-  const centreTile = getTile(
-    Math.floor((player.x + player.w / 2) / CFG.TILE),
-    Math.floor((player.y + player.h / 2) / CFG.TILE)
-  );
-  const speed = CFG.SPEED * (centreTile === T.WATER ? CFG.WATER_SLOW : 1);
+  const mcx = Math.floor((player.x + player.w / 2) / CFG.TILE);
+  const inWater = getTile(mcx, Math.floor((player.y + player.h / 2) / CFG.TILE)) === T.WATER ||
+                  getTile(mcx, Math.floor((player.y + player.h - 1) / CFG.TILE)) === T.WATER;
+  const speed = CFG.SPEED * (inWater ? CFG.WATER_SLOW : 1);
 
-  if (player.freeMove) {
-    let mx = rawX, my = rawY;
-    if (mx && my) { mx *= Math.SQRT1_2; my *= Math.SQRT1_2; }
-    const nx = player.x + mx * speed * dt;
-    const ny = player.y + my * speed * dt;
-    if (!boxHitsSolid(nx, player.y)) player.x = nx;
-    if (!boxHitsSolid(player.x, ny)) player.y = ny;
-    if (mx || my) player.animPhase += speed * dt * 0.09;
-  } else {
-    if (rawX) {
-      player.x += rawX * speed * dt;
+  // ---- horizontal ----
+  if (ix) {
+    const dx = ix * speed * dt;
+    if (!boxHitsSolid(player.x + dx, player.y)) {
+      player.x += dx;
+    } else if (!player.underground) {
+      // auto-climb a one-tile lip so strolling the rolling surface stays smooth
+      for (let lift = 8; lift <= CFG.STEP_UP; lift += 8) {
+        if (!boxHitsSolid(player.x + dx, player.y - lift)) {
+          player.x += dx;
+          player.y -= lift;
+          break;
+        }
+      }
+    }
+    player.animPhase += speed * dt * 0.09;
+  }
+
+  // ---- vertical ----
+  if (player.underground) {
+    player.vy = 0;
+    if (iy) {
+      const dy = iy * speed * dt;
+      if (!boxHitsSolid(player.x, player.y + dy)) player.y += dy;
       player.animPhase += speed * dt * 0.09;
     }
-    player.x = clamp(player.x, 0, MAP_PX_W - player.w);
-
-    // always scan DOWN from above the ground line for this column's true top,
-    // so the ant climbs rising terrain instead of ploughing through; rest on
-    // the first solid tile OR the surface of a puddle (waded, not sunk into)
-    const cx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
-    let gr = Math.max(0, surfaceAt[cx] - 4);
-    while (gr < CFG.MAP_H && !tileIsSolid(cx, gr) && getTile(cx, gr) !== T.WATER) gr++;
-    const restY = gr * CFG.TILE - player.h;
-    if (player.y < restY)      player.y = Math.min(restY, player.y + CFG.SETTLE_DOWN * dt);
-    else if (player.y > restY) player.y = Math.max(restY, player.y - CFG.SETTLE_UP * dt);
+  } else {
+    // gravity: settle onto the ground (or the surface of a puddle). Up/down
+    // don't move the ant here, they only aim it — there is no jump.
+    player.vy = Math.min(player.vy + CFG.GRAVITY * dt, CFG.MAX_FALL);
+    const dy = player.vy * dt;
+    if (!boxHitsFloor(player.x, player.y + dy)) {
+      player.y += dy;
+    } else {
+      let step = Math.max(1, Math.ceil(dy));
+      while (step-- > 0 && !boxHitsFloor(player.x, player.y + 1)) player.y += 1;
+      player.vy = 0;
+    }
   }
 
   player.x = clamp(player.x, 0, MAP_PX_W - player.w);
   player.y = clamp(player.y, 0, MAP_PX_H - player.h);
+
+  // last-ditch un-stick, in case terrain ever closes around the ant
+  let safety = CFG.TILE;
+  while (safety-- > 0 && boxHitsSolid(player.x, player.y)) player.y -= 1;
 
   const ptx = clamp(Math.floor((player.x + player.w / 2) / CFG.TILE), 0, CFG.MAP_W - 1);
   const pfy = Math.floor((player.y + player.h) / CFG.TILE);
   player.depth = Math.max(0, pfy - surfaceAt[ptx]);
 }
 
-// Walk over a twig to pick it up.
-function collectTwigs() {
-  const x0 = Math.floor(player.x / CFG.TILE);
-  const y0 = Math.floor(player.y / CFG.TILE);
-  const x1 = Math.floor((player.x + player.w - 1) / CFG.TILE);
-  const y1 = Math.floor((player.y + player.h - 1) / CFG.TILE);
-  for (let ty = y0; ty <= y1; ty++)
-    for (let tx = x0; tx <= x1; tx++)
-      if (getTile(tx, ty) === T.TWIG) {
-        setTile(tx, ty, T.AIR);
-        twigs++;
-        puff(tx * CFG.TILE + CFG.TILE / 2, ty * CFG.TILE + CFG.TILE / 2, false);
-      }
-}
-
-/* --- 6. INPUT -------------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   6. INPUT
+   ------------------------------------------------------------------------- */
 const keys = new Set();
 const mouse = { x: 0, y: 0, down: false };
 
@@ -359,7 +395,9 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-/* --- 7. CAMERA ---------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   7. CAMERA
+   ------------------------------------------------------------------------- */
 const cam = { x: 0, y: 0, zoom: 1 };
 
 function zoomBy(factor) {
@@ -373,7 +411,7 @@ function updateCamera(dt) {
   const targetX = player.x + player.w / 2 - viewWunits / 2;
   const targetY = player.y + player.h / 2 - viewHunits / 2;
 
-  const t = 1 - Math.exp(-CFG.CAM_LERP * dt);   // frame-rate-independent smoothing
+  const t = 1 - Math.exp(-CFG.CAM_LERP * dt);
   cam.x += (targetX - cam.x) * t;
   cam.y += (targetY - cam.y) * t;
 
@@ -383,14 +421,22 @@ function updateCamera(dt) {
 
 const worldToScreen = (wx, wy) => ({ x: (wx - cam.x) * cam.zoom, y: (wy - cam.y) * cam.zoom });
 const screenToWorld = (sx, sy) => ({ x: sx / cam.zoom + cam.x, y: sy / cam.zoom + cam.y });
+const scaleLabel = () => '1:' + Math.max(1, Math.round(24 / cam.zoom));
 
-/* --- 8. DIGGING (and back-filling) ------------------------------------- */
+/* ---------------------------------------------------------------------------
+   8. DIGGING  (and back-filling)
+   ------------------------------------------------------------------------- */
 const digProgress = new Map();   // "tx,ty" -> seconds worked so far (persists between visits)
 let digTarget = null;
 let tilesDug = 0;
 let dirtCarried = 0;
-let twigs = 0;
 let fillCooldown = 0;
+
+// The ant's aim as a unit-ish direction vector (never zero).
+function aimVec() {
+  if (player.face.x || player.face.y) return player.face;
+  return { x: player.flip ? -1 : 1, y: 0 };
+}
 
 function pickDigTarget() {
   if (mouse.down) {
@@ -415,12 +461,6 @@ function pickDigTarget() {
   return null;
 }
 
-// The ant's aim as a direction vector (never zero).
-function aimVec() {
-  if (player.face.x || player.face.y) return player.face;
-  return { x: player.flip ? -1 : 1, y: 0 };
-}
-
 function updateDigging(dt) {
   digTarget = pickDigTarget();
   if (!digTarget) return;
@@ -432,7 +472,7 @@ function updateDigging(dt) {
 
   if (worked >= need) {
     const wasRock = getTile(tx, ty) === T.ROCK;
-    setTile(tx, ty, T.TUNNEL);           // dug tiles stay dug — never regenerated
+    setTile(tx, ty, T.TUNNEL);           // dug tiles stay dug
     digProgress.delete(key);
     tilesDug++;
     dirtCarried += wasRock ? 2 : 1;
@@ -442,45 +482,32 @@ function updateDigging(dt) {
   }
 }
 
-// Where a back-fill goes. Standing still, you fill the tile you aim at. While
-// walking, you seal the tunnel BEHIND you as you retreat — and a tile you're
-// actively pressing into is never chosen, so a fill can't wall the ant in.
-function fillTargetTile() {
-  const cx = Math.floor((player.x + player.w / 2) / CFG.TILE);
-  const cy = Math.floor((player.y + player.h / 2) / CFG.TILE);
-  const d = aimVec();
-  const walking = keyDown('a', 'arrowleft', 'd', 'arrowright', 'w', 'arrowup', 's', 'arrowdown');
-  const pressingInto = (ox, oy) =>
-    (ox > 0 && keyDown('d', 'arrowright')) || (ox < 0 && keyDown('a', 'arrowleft')) ||
-    (oy > 0 && keyDown('s', 'arrowdown'))  || (oy < 0 && keyDown('w', 'arrowup'));
-
-  const cands = walking
-    ? [[-d.x, -d.y], [0, 1], [d.x, d.y], [0, -1], [1, 0], [-1, 0]]
-    : [[d.x, d.y], [0, 1], [-d.x, -d.y], [0, -1], [1, 0], [-1, 0]];
-
-  for (const [ox, oy] of cands) {
-    if ((!ox && !oy) || pressingInto(ox, oy)) continue;
-    const tx = cx + ox, ty = cy + oy;
-    if (getTile(tx, ty) === T.TUNNEL && !boxOverlapsTile(tx, ty)) return { tx, ty };
-  }
-  return null;
-}
-
+// Back-fill packs dirt into the one tunnel tile the ant is FACING. Held while
+// walking forward you'll wall yourself in — that's the natural consequence of
+// filling ahead; dig back through if you need to.
 function updateFill(dt) {
   fillCooldown -= dt;
   if (!keys.has('f') || dirtCarried <= 0 || fillCooldown > 0) return;
 
-  const tgt = fillTargetTile();
-  if (!tgt) return;
+  const d = aimVec();
+  const cx = Math.floor((player.x + player.w / 2) / CFG.TILE) + d.x;
+  const cy = Math.floor((player.y + player.h / 2) / CFG.TILE) + d.y;
+  if (getTile(cx, cy) !== T.TUNNEL || boxOverlapsTile(cx, cy)) return;
 
-  setTile(tgt.tx, tgt.ty, T.DIRT);
+  setTile(cx, cy, T.DIRT);
   dirtCarried--;
   tilesDug = Math.max(0, tilesDug - 1);
-  puff(tgt.tx * CFG.TILE + CFG.TILE / 2, tgt.ty * CFG.TILE + CFG.TILE / 2, false);
+  puff(cx * CFG.TILE + CFG.TILE / 2, cy * CFG.TILE + CFG.TILE / 2, false);
   fillCooldown = CFG.FILL_COOLDOWN;
+
+  // if that fill left the ant clipping the new wall, ease it back out
+  let guard = CFG.TILE;
+  while (guard-- > 0 && boxHitsSolid(player.x, player.y)) player.x -= d.x;
 }
 
-/* --- 9. PARTICLES (dirt puffs on dig / fill / twig pickup) ---------------- */
+/* ---------------------------------------------------------------------------
+   9. PARTICLES  (spoil flecks on dig / fill)
+   ------------------------------------------------------------------------- */
 const particles = [];
 
 function puff(x, y, rock) {
@@ -494,8 +521,8 @@ function puff(x, y, rock) {
       vy: Math.sin(a) * sp - 20,
       life: 0.5 + Math.random() * 0.4,
       max: 0.9,
-      r: 1 + Math.random() * 2.5,
-      col: rock ? '#8d8d8d' : (Math.random() < 0.5 ? '#6b4326' : '#7d5233'),
+      r: 1.5 + Math.random() * 2,
+      rot: Math.random() * Math.PI,
     });
   }
 }
@@ -512,33 +539,106 @@ function updateParticles(dt) {
   }
 }
 
-/* --- 10. UPDATE --------------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   10. UPDATE
+   ------------------------------------------------------------------------- */
 function update(dt) {
   movePlayer(dt);
-  collectTwigs();
   updateDigging(dt);
   updateFill(dt);
   updateParticles(dt);
   updateCamera(dt);
 }
 
-/* --- 11. RENDER ------------------------------------------------------------ */
-let nowMs = 0;
-const rgb = (r, g, b) => `rgb(${r | 0},${g | 0},${b | 0})`;
+/* ---------------------------------------------------------------------------
+   11. RENDER  —  a blueprint sheet
+   ------------------------------------------------------------------------- */
 
-function tileTint(tx, ty) {
-  let h = (tx * 73856093) ^ (ty * 19349663);
-  return ((h >>> 0) % 17) - 8;   // -8 .. +8
+// Pre-rendered 32x32 hatch stamps, built once. Drawing ~thousands of these
+// per frame is far cheaper than re-stroking hatching tile by tile.
+const STAMP = {};
+function buildStamps() {
+  const S = CFG.TILE;
+  const mk = (draw) => {
+    const c = document.createElement('canvas');
+    c.width = c.height = S;
+    const g = c.getContext('2d');
+    draw(g, S);
+    return c;
+  };
+
+  STAMP[T.DIRT] = mk((g) => {
+    g.strokeStyle = BP.inkDim;
+    g.lineWidth = 1;
+    for (let i = -S; i < S; i += 6) { g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke(); }
+    g.strokeStyle = 'rgba(219,233,244,0.14)';
+    g.strokeRect(0.5, 0.5, S - 1, S - 1);
+  });
+
+  STAMP[T.ROCK] = mk((g) => {
+    g.strokeStyle = 'rgba(219,233,244,0.42)';
+    g.lineWidth = 1;
+    for (let i = -S; i < S; i += 5) {
+      g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke();
+      g.beginPath(); g.moveTo(i, 0); g.lineTo(i + S, S); g.stroke();
+    }
+    g.strokeStyle = 'rgba(219,233,244,0.55)';
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(S * 0.5, S * 0.2);
+    g.lineTo(S * 0.8, S * 0.5);
+    g.lineTo(S * 0.5, S * 0.8);
+    g.lineTo(S * 0.2, S * 0.5);
+    g.closePath();
+    g.stroke();
+  });
+
+  STAMP[T.GRASS] = mk((g) => {
+    g.strokeStyle = BP.inkDim;
+    g.lineWidth = 1;
+    for (let i = -S; i < S; i += 6) { g.beginPath(); g.moveTo(i, S); g.lineTo(i + S, 0); g.stroke(); }
+    g.strokeStyle = BP.ink;
+    g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(0, 6); g.lineTo(S, 6); g.stroke();
+    g.lineWidth = 1;
+    for (let x = 3; x < S; x += 6) {
+      g.beginPath(); g.moveTo(x, 6.5); g.lineTo(x - 2.5, 0.5); g.stroke();
+      g.beginPath(); g.moveTo(x + 2.5, 6.5); g.lineTo(x + 4.5, 1.5); g.stroke();
+    }
+  });
+
+  STAMP[T.TUNNEL] = mk((g) => {
+    g.fillStyle = BP.void;
+    g.fillRect(0, 0, S, S);
+    g.strokeStyle = 'rgba(219,233,244,0.20)';
+    g.lineWidth = 1;
+    g.setLineDash([3, 3]);
+    g.strokeRect(0.5, 0.5, S - 1, S - 1);
+    g.setLineDash([]);
+  });
+
+  STAMP[T.WATER] = mk((g) => {
+    g.strokeStyle = 'rgba(143,219,207,0.75)';
+    g.lineWidth = 1.2;
+    for (let yy = 8; yy < S; yy += 9) {
+      g.beginPath();
+      for (let xx = 0; xx <= S; xx += 3) g.lineTo(xx, yy + Math.sin(xx * 0.7) * 1.7);
+      g.stroke();
+    }
+  });
 }
 
 function render() {
-  ctx.fillStyle = '#8ec7e6';
+  // the sheet
+  ctx.fillStyle = BP.sky;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
   ctx.save();
   ctx.scale(cam.zoom, cam.zoom);
   ctx.translate(-cam.x, -cam.y);
 
+  drawGroundWash();
+  drawGrid();
   drawTiles();
   drawDigOverlay();
   drawParticles();
@@ -547,7 +647,40 @@ function render() {
   ctx.restore();
 
   drawLighting();
+  drawSheet();
   drawHUD();
+}
+
+// A darker blue below each column's ground line, so underground reads as "inside".
+function drawGroundWash() {
+  const S = CFG.TILE;
+  const x0 = Math.max(0, Math.floor(cam.x / S));
+  const x1 = Math.min(CFG.MAP_W - 1, Math.ceil((cam.x + VIEW_W / cam.zoom) / S));
+  const yBot = Math.min(MAP_PX_H, cam.y + VIEW_H / cam.zoom + S);
+  ctx.fillStyle = BP.deep;
+  for (let tx = x0; tx <= x1; tx++) {
+    const top = surfaceAt[tx] * S;
+    if (yBot > top) ctx.fillRect(tx * S, top, S, yBot - top);
+  }
+}
+
+// Graph-paper grid, world-locked, ~1px on screen at any zoom.
+function drawGrid() {
+  const S = CFG.TILE;
+  const lx0 = Math.floor(cam.x / S) * S;
+  const ly0 = Math.floor(cam.y / S) * S;
+  const lx1 = cam.x + VIEW_W / cam.zoom;
+  const ly1 = cam.y + VIEW_H / cam.zoom;
+  ctx.lineWidth = 1 / cam.zoom;
+
+  for (let x = lx0; x <= lx1; x += S) {
+    ctx.strokeStyle = (Math.round(x / S) % 4 === 0) ? 'rgba(219,233,244,0.15)' : 'rgba(219,233,244,0.06)';
+    ctx.beginPath(); ctx.moveTo(x, ly0 - S); ctx.lineTo(x, ly1 + S); ctx.stroke();
+  }
+  for (let y = ly0; y <= ly1; y += S) {
+    ctx.strokeStyle = (Math.round(y / S) % 4 === 0) ? 'rgba(219,233,244,0.15)' : 'rgba(219,233,244,0.06)';
+    ctx.beginPath(); ctx.moveTo(lx0 - S, y); ctx.lineTo(lx1 + S, y); ctx.stroke();
+  }
 }
 
 function drawTiles() {
@@ -560,66 +693,8 @@ function drawTiles() {
   for (let ty = y0; ty <= y1; ty++) {
     for (let tx = x0; tx <= x1; tx++) {
       const v = grid[tIndex(tx, ty)];
-      const px = tx * S, py = ty * S;
-      const n = tileTint(tx, ty);
-
-      switch (v) {
-        case T.AIR:
-          break;
-
-        case T.TUNNEL:
-          ctx.fillStyle = rgb(42 + n, 31 + n, 25 + n);
-          ctx.fillRect(px, py, S, S);
-          ctx.fillStyle = 'rgba(0,0,0,0.25)';
-          ctx.fillRect(px, py, S, 3);
-          break;
-
-        case T.GRASS:
-          ctx.fillStyle = rgb(120 + n, 78 + n, 46 + n);
-          ctx.fillRect(px, py, S, S);
-          ctx.fillStyle = rgb(78 + n, 138 + n, 62 + n);
-          ctx.fillRect(px, py, S, 7);
-          break;
-
-        case T.DIRT:
-          ctx.fillStyle = rgb(120 + n, 78 + n, 46 + n);
-          ctx.fillRect(px, py, S, S);
-          ctx.fillStyle = rgb(95 + n, 60 + n, 34 + n);
-          ctx.fillRect(px + ((tx * 11) % (S - 6)), py + ((ty * 7) % (S - 6)), 3, 3);
-          ctx.fillRect(px + ((tx * 19 + 5) % (S - 4)), py + ((ty * 13 + 9) % (S - 4)), 2, 2);
-          break;
-
-        case T.ROCK:
-          ctx.fillStyle = rgb(120 + n, 120 + n, 128 + n);
-          ctx.fillRect(px, py, S, S);
-          ctx.fillStyle = rgb(99 + n, 99 + n, 107 + n);
-          ctx.fillRect(px + 4, py + 4, S - 8, S - 8);
-          break;
-
-        case T.WATER: {
-          ctx.fillStyle = rgb(58, 120, 190);
-          ctx.fillRect(px, py, S, S);
-          ctx.fillStyle = 'rgba(255,255,255,0.12)';
-          const wob = Math.sin(nowMs * 0.002 + tx * 0.6) * 2;
-          ctx.fillRect(px, py + 4 + wob, S, 3);
-          break;
-        }
-
-        case T.TWIG: {
-          ctx.strokeStyle = rgb(122, 84, 48);
-          ctx.lineWidth = 2.5;
-          ctx.lineCap = 'round';
-          const bx = px + 7, by = py + S - 8;
-          ctx.beginPath();
-          ctx.moveTo(bx, by);
-          ctx.lineTo(bx + 15, by - 9);
-          ctx.moveTo(bx + 9, by - 5.4);
-          ctx.lineTo(bx + 14, by - 1);
-          ctx.stroke();
-          ctx.lineCap = 'butt';
-          break;
-        }
-      }
+      if (v === T.AIR) continue;
+      ctx.drawImage(STAMP[v], tx * S, ty * S);
     }
   }
 }
@@ -631,30 +706,43 @@ function drawDigOverlay() {
     const [tx, ty] = key.split(',').map(Number);
     const need = getTile(tx, ty) === T.ROCK ? CFG.DIG_TIME_ROCK : CFG.DIG_TIME_DIRT;
     const f = clamp(worked / need, 0, 1);
-    const px = tx * S, py = ty * S;
+    const mx = tx * S + S / 2, my = ty * S + S / 2;
 
-    ctx.fillStyle = `rgba(0,0,0,${0.15 + 0.4 * f})`;
-    ctx.fillRect(px + (f * S) / 2, py + (f * S) / 2, S - f * S, S - f * S);
-
-    ctx.strokeStyle = '#ffd479';
-    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(219,233,244,0.55)';
+    ctx.lineWidth = 1;
+    for (let a = 0; a < 6; a++) {
+      const th = (a / 6) * Math.PI * 2 + 0.3;
+      ctx.beginPath();
+      ctx.moveTo(mx, my);
+      ctx.lineTo(mx + Math.cos(th) * S * 0.42 * f, my + Math.sin(th) * S * 0.42 * f);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = BP.accent;
+    ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(px + S / 2, py + S / 2, S * 0.32, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
+    ctx.arc(mx, my, S * 0.34, -Math.PI / 2, -Math.PI / 2 + f * Math.PI * 2);
     ctx.stroke();
   }
 
   if (digTarget) {
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(digTarget.tx * S + 1, digTarget.ty * S + 1, S - 2, S - 2);
+    ctx.strokeStyle = BP.ink;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(digTarget.tx * S + 1.5, digTarget.ty * S + 1.5, S - 3, S - 3);
+    ctx.setLineDash([]);
   }
 }
 
 function drawParticles() {
+  ctx.strokeStyle = BP.ink;
+  ctx.lineWidth = 1;
   for (const p of particles) {
-    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
-    ctx.fillStyle = p.col;
-    ctx.fillRect(p.x - p.r, p.y - p.r, p.r * 2, p.r * 2);
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1) * 0.9;
+    const c = Math.cos(p.rot) * p.r, s = Math.sin(p.rot) * p.r;
+    ctx.beginPath();
+    ctx.moveTo(p.x - c, p.y - s);
+    ctx.lineTo(p.x + c, p.y + s);
+    ctx.stroke();
   }
   ctx.globalAlpha = 1;
 }
@@ -664,8 +752,25 @@ function drawAnt() {
   const cy = player.y + player.h / 2;
   const wig = Math.sin(player.animPhase) * 2;
 
-  // point the ant along its aim vector; when it faces left-ish, mirror
-  // vertically so the belly stays down instead of drawing upside-down
+  // a drafting "survey target" so the ant is always findable on a busy sheet
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.strokeStyle = 'rgba(143,219,207,0.5)';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 4]);
+  ctx.beginPath();
+  ctx.arc(0, 0, 20, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(143,219,207,0.28)';
+  ctx.beginPath();
+  ctx.moveTo(-26, 0); ctx.lineTo(-20, 0);
+  ctx.moveTo(20, 0);  ctx.lineTo(26, 0);
+  ctx.moveTo(0, -26); ctx.lineTo(0, -20);
+  ctx.moveTo(0, 20);  ctx.lineTo(0, 26);
+  ctx.stroke();
+  ctx.restore();
+
   let fx = player.face.x, fy = player.face.y;
   if (!fx && !fy) { fx = player.flip ? -1 : 1; fy = 0; }
   const ang = Math.atan2(fy, fx);
@@ -673,114 +778,155 @@ function drawAnt() {
   ctx.save();
   ctx.translate(cx, cy);
   ctx.rotate(ang);
-  if (Math.cos(ang) < -0.001) ctx.scale(1, -1);
+  if (Math.cos(ang) < -0.001) ctx.scale(1, -1);   // keep the belly down when facing left
+  ctx.scale(1.15, 1.15);
 
-  ctx.strokeStyle = '#20130b';
+  ctx.strokeStyle = BP.ink;
   ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+
   for (let i = 0; i < 3; i++) {
     const lx = -6 + i * 6;
     const k = i % 2 ? wig : -wig;
     ctx.beginPath();
-    ctx.moveTo(lx, 0); ctx.lineTo(lx - 3, 6 + k);
-    ctx.moveTo(lx, 0); ctx.lineTo(lx - 3, -6 - k);
+    ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, 7 + k);
+    ctx.moveTo(lx, 0); ctx.lineTo(lx - 4, -7 - k);
     ctx.stroke();
   }
 
-  ctx.fillStyle = '#241009';
-  dot(-7, 0, 6, 5);
-  dot(0, 0, 4, 3.5);
-  dot(7, 0, 3.6, 3.6);
+  strokeEllipse(-7, 0, 6, 5);
+  strokeEllipse(0, 0, 4, 3.6);
+  strokeEllipse(7, 0, 3.8, 3.8);
 
-  ctx.strokeStyle = '#241009';
   ctx.beginPath();
-  ctx.moveTo(9, -1); ctx.lineTo(13, -4);
-  ctx.moveTo(9, 1);  ctx.lineTo(13, 4);
+  ctx.moveTo(9, -1.6); ctx.lineTo(13.5, -5);
+  ctx.moveTo(9, 1.6);  ctx.lineTo(13.5, 5);
   ctx.stroke();
 
-  ctx.fillStyle = '#ffcf6b';
-  ctx.fillRect(10, -1.5, 3, 3);
+  ctx.fillStyle = BP.accent;
+  ctx.beginPath();
+  ctx.moveTo(10.5, 0); ctx.lineTo(14.5, -2.6); ctx.lineTo(14.5, 2.6);
+  ctx.closePath();
+  ctx.fill();
 
   if (dirtCarried > 0) {
-    ctx.fillStyle = '#7d5233';
-    ctx.beginPath();
-    ctx.arc(-9, -5, 3.5, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.strokeStyle = BP.ink;
+    ctx.strokeRect(-12, -8.5, 5, 5);
   }
 
   ctx.restore();
 
-  function dot(x, y, rx, ry) {
+  function strokeEllipse(x, y, rx, ry) {
     ctx.beginPath();
     ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.stroke();
   }
 }
 
-// Underground gloom that closes in with depth.
+// Going deep, the sheet darkens to deep navy around a lamp-lit disc.
 function drawLighting() {
   if (player.depth <= 2) return;
-  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.66;
+  const k = clamp((player.depth - 2) / 30, 0, 1) * 0.7;
   const s = worldToScreen(player.x + player.w / 2, player.y + player.h / 2);
-  const R = 260 * cam.zoom;
+  const R = 280 * cam.zoom;
 
-  const g = ctx.createRadialGradient(s.x, s.y, R * 0.18, s.x, s.y, R);
-  g.addColorStop(0.0, 'rgba(0,0,0,0)');
-  g.addColorStop(0.6, `rgba(0,0,0,${k * 0.45})`);
-  g.addColorStop(1.0, `rgba(0,0,0,${k})`);
+  const g = ctx.createRadialGradient(s.x, s.y, R * 0.15, s.x, s.y, R);
+  g.addColorStop(0.0, 'rgba(6,20,36,0)');
+  g.addColorStop(0.6, `rgba(6,20,36,${k * 0.5})`);
+  g.addColorStop(1.0, `rgba(6,20,36,${k})`);
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 }
 
+// Drawing-sheet border + drafting title block, bottom-right.
+function drawSheet() {
+  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(10.5, 10.5, VIEW_W - 21, VIEW_H - 21);
+  ctx.lineWidth = 2;
+  ctx.strokeRect(16.5, 16.5, VIEW_W - 33, VIEW_H - 33);
+
+  const bw = Math.min(264, VIEW_W - 60);
+  const bh = 66;
+  const bx = VIEW_W - 17 - bw;
+  const by = VIEW_H - 17 - bh;
+
+  ctx.fillStyle = 'rgba(12,42,69,0.9)';
+  ctx.fillRect(bx, by, bw, bh);
+  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx + 0.5, by + 0.5, bw, bh);
+  ctx.beginPath(); ctx.moveTo(bx, by + 27.5); ctx.lineTo(bx + bw, by + 27.5); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(bx + bw * 0.6, by + 27.5); ctx.lineTo(bx + bw * 0.6, by + bh); ctx.stroke();
+
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = BP.ink;
+  ctx.font = '600 14px ' + MONO;
+  ctx.fillText('A N T W O R K S', bx + 12, by + 19);
+  ctx.font = '10px ' + MONO;
+  ctx.fillStyle = 'rgba(219,233,244,0.72)';
+  ctx.fillText('COLONY EXCAVATION', bx + 12, by + 44);
+  ctx.fillText('SHEET 1 / 1', bx + 12, by + 57);
+  ctx.fillText('SCALE ' + scaleLabel(), bx + bw * 0.6 + 12, by + 44);
+  ctx.fillText('DEPTH ' + player.depth + ' u', bx + bw * 0.6 + 12, by + 57);
+}
+
 function drawHUD() {
-  ctx.font = '13px "Segoe UI", system-ui, sans-serif';
   ctx.textBaseline = 'top';
 
-  const help = [
-    'ANTWORKS',
-    'WASD / Arrows   move & aim',
-    'Space (aim at dirt)   dig',
-    'Click dirt   dig',
-    'F   fill a tunnel (uses dirt)',
-    'Wheel  or  + / -   zoom',
-  ];
-  panel(10, 10, 220, help.length * 17 + 12);
-  help.forEach((line, i) => {
-    ctx.fillStyle = i === 0 ? '#ffcf6b' : '#e9e9e9';
-    ctx.fillText(line, 20, 18 + i * 17);
-  });
+  annPanel(26, 26, 300, 'LEGEND', [
+    'WASD / ARROWS  ..  move & aim',
+    'SPACE (aim at soil)  excavate',
+    'CLICK a tile  ....  excavate',
+    'F (aim at tunnel)   back-fill',
+    'WHEEL  /  + −  ...  scale',
+  ]);
 
-  const stats = [
-    ['Tiles dug', tilesDug],
-    ['Dirt carried', dirtCarried],
-    ['Twigs', twigs],
-    ['Depth', player.depth],
-    ['Zoom', cam.zoom.toFixed(2) + 'x'],
-  ];
-  const pw = 176, rx = VIEW_W - pw - 10;
-  panel(rx, 10, pw, stats.length * 17 + 12);
-  stats.forEach(([label, val], i) => {
-    ctx.fillStyle = '#9fb4c8';
-    ctx.fillText(label, rx + 10, 18 + i * 17);
-    ctx.fillStyle = '#f2f2f2';
-    ctx.textAlign = 'right';
-    ctx.fillText(String(val), rx + pw - 10, 18 + i * 17);
-    ctx.textAlign = 'left';
-  });
+  const pw = 210;
+  annPanel(VIEW_W - 26 - pw, 26, pw, 'SURVEY', [
+    'EXCAVATED   ' + tilesDug,
+    'SPOIL LOAD  ' + dirtCarried,
+    'DEPTH       ' + player.depth + ' u',
+    'SCALE       ' + scaleLabel(),
+  ]);
 }
 
-function panel(x, y, w, h) {
-  ctx.fillStyle = 'rgba(15,12,10,0.68)';
+function annPanel(x, y, w, title, lines) {
+  const pad = 11, lh = 16;
+  const h = pad + 20 + lines.length * lh + pad - 4;
+
+  ctx.fillStyle = 'rgba(12,42,69,0.85)';
   ctx.fillRect(x, y, w, h);
-  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.strokeStyle = 'rgba(219,233,244,0.5)';
   ctx.lineWidth = 1;
   ctx.strokeRect(x + 0.5, y + 0.5, w, h);
+
+  ctx.beginPath();
+  for (const [ex, ey] of [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]) {
+    ctx.moveTo(ex - 4, ey); ctx.lineTo(ex + 4, ey);
+    ctx.moveTo(ex, ey - 4); ctx.lineTo(ex, ey + 4);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = BP.accent;
+  ctx.font = '10px ' + MONO;
+  ctx.fillText(title, x + pad, y + pad);
+  ctx.strokeStyle = 'rgba(219,233,244,0.28)';
+  ctx.beginPath();
+  ctx.moveTo(x + pad, y + pad + 15); ctx.lineTo(x + w - pad, y + pad + 15);
+  ctx.stroke();
+
+  ctx.fillStyle = BP.ink;
+  ctx.font = '11px ' + MONO;
+  lines.forEach((t, i) => ctx.fillText(t, x + pad, y + pad + 22 + i * lh));
 }
 
-/* --- 12. LOOP + BOOTSTRAP -------------------------------------------------- */
+/* ---------------------------------------------------------------------------
+   12. LOOP + BOOTSTRAP
+   ------------------------------------------------------------------------- */
 let last = 0;
 
 function frame(ts) {
-  nowMs = ts;
   let dt = (ts - last) / 1000;
   last = ts;
   if (dt > 0.05) dt = 0.05;
@@ -792,6 +938,7 @@ function frame(ts) {
 
 function init() {
   resize();
+  buildStamps();
   const spawn = generateWorld();
   spawnPlayer(spawn.sx, spawn.sy);
 
@@ -800,6 +947,9 @@ function init() {
   cam.x = clamp(player.x + player.w / 2 - vw / 2, 0, Math.max(0, MAP_PX_W - vw));
   cam.y = clamp(player.y + player.h / 2 - vh / 2, 0, Math.max(0, MAP_PX_H - vh));
 
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load('11px "IBM Plex Mono"').catch(() => {});
+  }
   requestAnimationFrame(frame);
 }
 
